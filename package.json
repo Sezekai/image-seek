@@ -1,0 +1,58 @@
+{
+  "name": "image-seek",
+  "productName": "Image Seek",
+  "version": "1.0.0",
+  "description": "Identify images and find higher-resolution versions",
+  "main": "src/main/main.js",
+  "author": "Sezekai",
+  "license": "UNLICENSED",
+  "private": true,
+  "scripts": {
+    "start": "electron .",
+    "test": "node test/run.js",
+    "dist": "electron-builder --win portable --x64"
+  },
+  "dependencies": {
+    "@fontsource/inter": "5.3.0",
+    "@ghostery/adblocker-electron": "2.20.3",
+    "darkreader": "4.9.134",
+    "electron-chrome-extensions": "4.10.0",
+    "electron-chrome-web-store": "0.13.0",
+    "sql.js": "1.15.2"
+  },
+  "devDependencies": {
+    "electron": "45.2.1",
+    "electron-builder": "26.18.0"
+  },
+  "build": {
+    "appId": "com.sezekai.imageseek",
+    "productName": "Image Seek",
+    "directories": {
+      "output": "dist",
+      "buildResources": "build"
+    },
+    "files": [
+      "src/**/*",
+      "build/icon.png",
+      "build/drag.png",
+      "package.json"
+    ],
+    "asar": true,
+    "win": {
+      "target": [
+        {
+          "target": "portable",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "icon": "build/icon.ico"
+    },
+    "portable": {
+      "artifactName": "ImageSeek.exe",
+      "unpackDirName": "ImageSeek"
+    },
+    "compression": "normal"
+  }
+}
