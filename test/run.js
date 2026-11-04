@@ -431,18 +431,23 @@ test('new images in an added folder are picked up', async () => {
   assert.strictEqual(Object.keys(lib.d.items).length, 3);
   const n1 = path.join(src, 'new.png');
   fs.copyFileSync(path.join(FX, 'a.png'), n1);
-  old(n1);
+  old(n1); // copies keep the old modified time (as on Windows)
   const busy = path.join(src, 'copying.jpg');
-  fs.copyFileSync(path.join(FX, 'q85.jpg'), busy); // just written: skipped until it settles
+  fs.copyFileSync(path.join(FX, 'q85.jpg'), busy);
+  old(busy);
   const sub = path.join(src, 'sub');
   fs.mkdirSync(sub);
   fs.copyFileSync(path.join(FX, 'q85.jpg'), path.join(sub, 'deep.jpg'));
-  old(path.join(sub, 'deep.jpg'));
+  const wait = (ms) => new Promise((res) => setTimeout(res, ms));
   let r = await lib.reconcile([n1, busy, path.join(sub, 'deep.jpg')]);
-  assert.deepStrictEqual(r.added.map((i) => i.name), ['new.png'], 'not recursive, busy file waits');
-  old(busy);
+  assert.deepStrictEqual(r.added.map((i) => i.name), [], 'just-created files wait for a second look');
+  fs.appendFileSync(busy, Buffer.alloc(100)); // still being written
+  await wait(1600);
   r = await lib.reconcile([]);
-  assert.deepStrictEqual(r.added.map((i) => i.name), ['copying.jpg'], 'settled file picked up on the next pass');
+  assert.deepStrictEqual(r.added.map((i) => i.name), ['new.png'], 'stable file taken; growing file and subfolder skipped');
+  await wait(1600);
+  r = await lib.reconcile([]);
+  assert.deepStrictEqual(r.added.map((i) => i.name), ['copying.jpg'], 'settled file picked up');
   // full rescan finds nothing more; re-adding the folder with subfolders picks up the deep one
   r = await lib.reconcile(null);
   assert.strictEqual(r.added.length, 0);
@@ -453,7 +458,8 @@ test('new images in an added folder are picked up', async () => {
   lib.settings.get().autoAdd = false;
   const n2 = path.join(src, 'n2.png');
   fs.copyFileSync(path.join(FX, 'a.png'), n2);
-  old(n2);
+  r = await lib.reconcile(null);
+  await wait(1600);
   r = await lib.reconcile(null);
   assert.strictEqual(r.added.length, 0);
 });

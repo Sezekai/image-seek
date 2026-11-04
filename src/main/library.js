@@ -738,15 +738,24 @@ class Library {
       }
       files = files.filter((p) => !skip(p));
       if (!files.length) continue;
-      // Ignore files still being copied in; the watcher will report them again.
+      // Skip files that may still be copying in: a file is taken once it was created a while ago,
+      // or its size and modified time stayed the same across two checks (copies on Windows keep
+      // the original modified time, so that alone can't be trusted).
       const ready = [];
+      const now = Date.now();
+      this.sightings = this.sightings || new Map();
       for (const f of files) {
-        try {
-          const st = await fsp.stat(f);
-          if (st.isFile() && st.size > 0 && Date.now() - st.mtimeMs > 1500) ready.push(f);
-          else if (st.isFile()) this.later = (this.later || new Set()).add(f);
-        } catch { /* gone again */ }
+        let st;
+        try { st = await fsp.stat(f); } catch { continue; }
+        if (!st.isFile() || st.size === 0) { this.later = (this.later || new Set()).add(f); continue; }
+        const born = Math.max(st.birthtimeMs || 0, st.ctimeMs || 0, st.mtimeMs || 0);
+        const prev = this.sightings.get(f);
+        const stable = prev && prev.size === st.size && prev.mtime === st.mtimeMs && now - prev.at >= 1500;
+        if (now - born > 10000 || stable) { ready.push(f); this.sightings.delete(f); continue; }
+        if (!prev || prev.size !== st.size || prev.mtime !== st.mtimeMs) this.sightings.set(f, { size: st.size, mtime: st.mtimeMs, at: now });
+        this.later = (this.later || new Set()).add(f);
       }
+      if (this.sightings.size > 2000) this.sightings.clear();
       const got = await this.addFiles(b, ready);
       if (got.length) { b.picked = (b.picked || 0) + got.length; added.push(...got); }
     }

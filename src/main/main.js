@@ -467,7 +467,10 @@ app.whenReady().then(async () => {
       queue.kick();
     }
     if (r.changes || (r.added && r.added.length)) queue.pushStatus();
+    // Files still copying in get another look shortly.
+    if (lib.later && lib.later.size && !laterTimer) laterTimer = setTimeout(() => { laterTimer = null; lib.reconcile([]).then(onReconciled).catch(() => {}); }, 2500);
   };
+  let laterTimer = null;
   lib.onReconciled = onReconciled;
   watcher = new FolderWatcher(lib, onReconciled, log);
   watcher.refresh();
