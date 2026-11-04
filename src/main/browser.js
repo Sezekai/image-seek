@@ -1,7 +1,7 @@
 'use strict';
 // In-app browser: tabs (webviews) bound to looked-up files, downloads routing, history,
 // ad blocking (built-in or uBO Lite), dark mode, autofill, extensions and the Chrome Web Store.
-const { app, session, net, Menu, clipboard, ipcMain, webContents: WC } = require('electron');
+const { app, session, net, Menu, clipboard, ipcMain, BrowserWindow, webContents: WC } = require('electron');
 const fs = require('fs');
 const fsp = fs.promises;
 const path = require('path');
@@ -202,7 +202,50 @@ class BrowserManager {
         if (list[i].url === url) { list[i].title = title; this.history.save(); break; }
       }
     });
+    // Per-site light / dark: Dark Reader runs from the page preload; this makes sites with
+    // their own dark theme follow the same choice (they'd otherwise follow Windows' theme).
+    this.attachScheme(wc);
+    wc.on('did-start-navigation', (d) => { if (d.isMainFrame && !d.isSameDocument) this.applyScheme(wc, d.url); });
     wc.on('destroyed', () => this.bindings.delete(wc.id));
+  }
+
+  attachScheme(wc) {
+    try { if (!wc.debugger.isAttached()) wc.debugger.attach('1.3'); } catch (_) { /* devtools open */ }
+  }
+
+  applyScheme(wc, url) {
+    if (!/^https?:/.test(url || '')) return;
+    const dark = this.themeFor(url) === 'dark';
+    try {
+      if (!wc.debugger.isAttached()) this.attachScheme(wc);
+      wc.debugger.sendCommand('Emulation.setEmulatedMedia', { features: [{ name: 'prefers-color-scheme', value: dark ? 'dark' : 'light' }] }).catch(() => {});
+    } catch (_) { /* ignore */ }
+  }
+
+  siteKey(url) {
+    try { return new URL(url).hostname.replace(/^www\./, ''); } catch { return ''; }
+  }
+
+  // 'dark' or 'light' for a page: the site's own setting, else its parent domain's, else the default.
+  themeFor(url) {
+    const s = this.settings.get();
+    const host = this.siteKey(url);
+    const map = s.siteThemes || {};
+    const parts = host.split('.');
+    for (let i = 0; i < parts.length - 1; i++) {
+      const h = parts.slice(i).join('.');
+      if (map[h]) return map[h];
+    }
+    return s.darkMode ? 'dark' : 'light';
+  }
+
+  setSiteTheme(url, theme) {
+    const host = this.siteKey(url);
+    if (!host) return this.settings.get();
+    const map = { ...(this.settings.get().siteThemes || {}) };
+    // drop parent-domain entries that would override this choice
+    map[host] = theme;
+    return this.settings.set({ siteThemes: map });
   }
 
   // ---------- context menu ----------
@@ -217,6 +260,7 @@ class BrowserManager {
       const orig = originalCandidates(src);
       if (orig.length) tmpl.push({ label: it ? 'Save original size to linked folder' : 'Save original size (unlinked)', click: () => this.saveOriginal(wc, src, itemId) });
       if (it) tmpl.push({ label: 'Save image as unlinked', click: () => this.saveUrl(wc, src, null) });
+      tmpl.push({ label: 'Save image as… (choose a folder)', click: () => this.saveAs(wc, src) });
       tmpl.push({ type: 'separator' });
       tmpl.push({ label: 'Open image in new tab', click: () => this.emit('browser:open', { url: src, active: true, itemId }) });
       tmpl.push({ label: 'Search this image with Google Lens', click: () => this.emit('browser:open', { url: 'https://lens.google.com/uploadbyurl?url=' + encodeURIComponent(src), active: true, itemId }) });
@@ -230,6 +274,7 @@ class BrowserManager {
       if (/\.(jpe?g|png|webp|gif|avif|bmp)(\?|$)/i.test(params.linkURL)) {
         tmpl.push({ label: it ? 'Save linked image to linked folder' : 'Save linked image (unlinked)', click: () => this.saveUrl(wc, params.linkURL, itemId) });
       }
+      tmpl.push({ label: 'Save link as… (choose a folder)', click: () => this.saveAs(wc, params.linkURL) });
       tmpl.push({ type: 'separator' });
     }
     if (params.isEditable) {
@@ -255,6 +300,25 @@ class BrowserManager {
     wc.downloadURL(url);
   }
 
+  // Normal "Save as" dialog: saved wherever you choose and not tracked by the app.
+  saveAs(wc, url) {
+    this.forcedTargets.set(url, { saveAs: true });
+    wc.downloadURL(url);
+  }
+
+  // Toolbar buttons on an image page: mode = 'linked' | 'unlinked' | 'saveas'
+  saveCurrent(wcId, mode) {
+    const wc = WC.fromId(wcId);
+    if (!wc) throw new Error('Tab not found');
+    const url = wc.getURL();
+    if (mode === 'saveas') return this.saveAs(wc, url);
+    const itemId = mode === 'linked' ? (this.bindings.get(wc.id) || null) : null;
+    if (mode === 'linked' && !itemId) throw new Error('This tab isn\'t linked to a file');
+    const orig = originalCandidates(url);
+    if (orig.length) return this.saveOriginal(wc, url, itemId);
+    return this.saveUrl(wc, url, itemId);
+  }
+
   async saveOriginal(wc, src, itemId) {
     const cands = originalCandidates(src);
     const referer = wc.getURL();
@@ -273,7 +337,22 @@ class BrowserManager {
     this.ses.on('will-download', (_e, item, wc) => {
       const url = item.getURL();
       let itemId = wc ? (this.bindings.get(wc.id) ?? null) : null;
-      if (this.forcedTargets.has(url)) { itemId = this.forcedTargets.get(url).itemId; this.forcedTargets.delete(url); }
+      const forced = this.forcedTargets.get(url);
+      if (forced) this.forcedTargets.delete(url);
+      if (forced && forced.saveAs) {
+        let name = fo.sanitizeName(decodeURIComponentSafe(item.getFilename() || 'image'));
+        if (!path.extname(name) && MIME_EXT[item.getMimeType()]) name += MIME_EXT[item.getMimeType()];
+        const dir = this.settings.get().lastSaveAsDir || app.getPath('pictures');
+        item.setSaveDialogOptions({ title: 'Save image', defaultPath: path.join(dir, name) });
+        item.once('done', (_ev, state) => {
+          if (state === 'completed' && item.getSavePath()) {
+            this.settings.set({ lastSaveAsDir: path.dirname(item.getSavePath()) });
+            this.log(`Saved ${path.basename(item.getSavePath())} to ${path.dirname(item.getSavePath())}`);
+          }
+        });
+        return; // Electron shows the Save dialog itself
+      }
+      if (forced) itemId = forced.itemId;
       const it = itemId ? this.lib.item(itemId) : null;
       if (!it) itemId = null;
       const dir = it ? this.lib.itemFolder(it) : this.lib.unlinkedFolder();
@@ -331,9 +410,7 @@ class BrowserManager {
   // ---------- page preload support ----------
   pageConfig(url) {
     const s = this.settings.get();
-    let host = '';
-    try { host = new URL(url).hostname; } catch (_) { /* ignore */ }
-    const dark = !!s.darkMode && /^https?:/.test(url) && !s.darkModeExclude.some((h) => host === h || host.endsWith('.' + h));
+    const dark = /^https?:/.test(url) && this.themeFor(url) === 'dark';
     return { dark, autofill: !!s.autofill && this.passwords.forUrl(url).length > 0 };
   }
 
@@ -349,6 +426,45 @@ class BrowserManager {
       if (e.sender.session !== this.ses || !this.settings.get().autofill) return [];
       return this.passwords.forUrl(url).map((l) => ({ username: l.username, password: l.password }));
     });
+  }
+
+  // ---------- hidden page used by lookups that need a real browser (ascii2d) ----------
+  hiddenWindow() {
+    if (this.hidden && !this.hidden.isDestroyed()) return this.hidden;
+    this.hidden = new BrowserWindow({
+      show: false, width: 1280, height: 900,
+      webPreferences: { partition: PARTITION, sandbox: true, contextIsolation: true, backgroundThrottling: false, offscreen: false },
+    });
+    this.hidden.webContents.setAudioMuted(true);
+    this.hidden.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
+    return this.hidden;
+  }
+
+  // Loads a page (optionally POSTing a form) and waits until done(url, html) is true.
+  // Returns { url, html, blocked } — blocked when a Cloudflare check never cleared.
+  async renderPage({ url, postData, contentType, referer, done, timeout = 40000 }) {
+    const w = this.hiddenWindow();
+    const wc = w.webContents;
+    const opts = {};
+    if (postData) {
+      opts.postData = [{ type: 'rawData', bytes: postData }];
+      opts.extraHeaders = `Content-Type: ${contentType}\n`;
+    }
+    if (referer) opts.httpReferrer = referer;
+    wc.loadURL(url, opts).catch(() => {}); // rejects on redirects; we poll below
+    const start = Date.now();
+    let html = '', cur = '';
+    let sawChallenge = false;
+    while (Date.now() - start < timeout) {
+      await new Promise((r) => setTimeout(r, 600));
+      if (w.isDestroyed()) break;
+      cur = wc.getURL();
+      if (wc.isLoading()) continue;
+      try { html = await wc.executeJavaScript('document.documentElement ? document.documentElement.outerHTML : ""', true); } catch (_) { html = ''; }
+      if (/cf-chl|challenge-platform|Just a moment|cf_chl_opt/i.test(html)) { sawChallenge = true; continue; }
+      if (done(cur, html)) return { url: cur, html, blocked: false };
+    }
+    return { url: cur, html, blocked: sawChallenge };
   }
 
   // ---------- history ----------

@@ -15,6 +15,9 @@ function defaults(paths) {
     adblock: 'builtin', // builtin | ubol | off
     darkMode: true,
     darkModeExclude: [],
+    siteThemes: {},
+    lastSaveAsDir: '',
+    dock: 'closed',
     homepage: 'https://www.google.com/',
     uploadMaxSide: 3000,
     uploadMaxBytes: 4 * 1024 * 1024,
@@ -38,6 +41,10 @@ class Settings {
     const s = this.store.data;
     s.engines = Object.assign({}, d.engines, s.engines);
     s.minSimilarity = Object.assign({}, d.minSimilarity, s.minSimilarity);
+    // Older versions kept a list of sites with dark mode turned off.
+    if (!s.siteThemes) s.siteThemes = {};
+    for (const h of s.darkModeExclude || []) if (!s.siteThemes[h]) s.siteThemes[h] = 'light';
+    s.darkModeExclude = [];
   }
   get() { return this.store.data; }
   set(patch) {

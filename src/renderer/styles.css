@@ -335,3 +335,39 @@ browser-action-list::part(badge) { font-size: 9px; }
 kbd { font-family: inherit; font-size: 10px; background: var(--card2); border: 1px solid var(--line2); border-bottom-width: 2px; border-radius: 4px; padding: 0 4px; color: var(--muted); }
 
 .spin { width: 14px; height: 14px; border: 2px solid var(--line2); border-top-color: var(--accent); border-radius: 50%; animation: spin .7s linear infinite; display: inline-block; }
+
+/* ---------- shared browser layer ---------- */
+.browser-layer { position: fixed; z-index: 30; display: flex; flex-direction: column; background: var(--panel); min-width: 0; min-height: 0; overflow: hidden; }
+.browser-layer.off { visibility: hidden; pointer-events: none; left: -10000px !important; }
+.browser-layer.off webview { visibility: hidden !important; }
+.browser-layer.docked { border-left: 1px solid var(--line); border-right: 1px solid var(--line); }
+.browser-layer .toolbar { min-height: 42px; }
+.browser-layer.narrow .sitebtn { padding: 0 8px; }
+.browser-layer.narrow .sitebtn svg { display: none; }
+.browser-layer .addr { min-width: 140px; }
+.browser-layer.narrow .bindbar .hint { display: none; }
+.browser-layer .savegroup { gap: 2px; }
+.browser-layer .savegroup .xs { margin: 0 4px 0 2px; }
+body.resizing webview, body.resizing .browser-layer { pointer-events: none; }
+body.resizing { cursor: col-resize; }
+
+/* ---------- lookups: file grid + docked browser ---------- */
+.lk-main { flex-direction: row !important; }
+.gridpane { flex: 1; min-width: 0; min-height: 0; display: flex; flex-direction: column; position: relative; }
+.gridpane > .resizer { left: auto; right: -3px; display: none; }
+.lk-main.dock-small .gridpane { flex: none; width: var(--side-w, 400px); border-right: 1px solid var(--line); }
+.lk-main.dock-small .gridpane > .resizer { display: block; }
+.lk-main.dock-expanded .gridpane { display: none; }
+.bslot { flex: 1; min-width: 0; display: none; }
+.lk-main.dock-small .bslot, .lk-main.dock-expanded .bslot { display: block; }
+
+/* ---------- collapsible match groups ---------- */
+.engine-head.toggle-head { cursor: pointer; user-select: none; padding: 3px 2px; border-radius: 6px; }
+.engine-head.toggle-head:hover { background: var(--card2); color: var(--text); }
+.engine-head svg { width: 14px; height: 14px; }
+.engine-head .cnt { color: var(--dim); font-weight: 500; letter-spacing: 0; }
+.sort-targets { display: flex; flex-direction: column; gap: 4px; margin-bottom: 8px; }
+.sort-targets .check img { width: 30px; height: 30px; object-fit: cover; border-radius: 5px; }
+.log-gone { color: var(--warn); }
+.check input[type=radio] { border-radius: 50%; }
+.check input[type=radio]:checked::after { width: 6px; height: 6px; border: 0; border-radius: 50%; background: #06130a; transform: none; }

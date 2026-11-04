@@ -228,7 +228,7 @@ test('multipart body', () => {
 });
 
 // ---------------- library: sort, undo, keep, relink ----------------
-test('library flow: sort, undo, compare-keep, relink, done', async () => {
+function makeLib() {
   const { Library } = require('../src/main/library');
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'lib-'));
   const src = path.join(root, 'src');
@@ -237,27 +237,29 @@ test('library flow: sort, undo, compare-keep, relink, done', async () => {
   const paths = { data: path.join(root, 'Data') };
   fs.mkdirSync(paths.data);
   const st = { downloadsDir: path.join(root, 'Downloads'), sortRoot: path.join(root, 'Sorted') };
-  const settings = { get: () => st };
-  const events = [];
-  const lib = new Library(paths, settings, (e, p) => events.push([e, p]));
-  const r = await lib.addBatch(src, 'identify', false);
+  const lib = new Library(paths, { get: () => st }, () => {});
+  return { lib, root, src, st };
+}
+
+test('library flow: sort, undo, compare-keep, relink, done', async () => {
+  const { lib, src, st } = makeLib();
+  const r = await lib.addBatch(src, false);
   assert.strictEqual(r.added, 3);
-  const again = await lib.addBatch(src, 'identify', false);
+  const again = await lib.addBatch(src, false);
   assert.strictEqual(again.added, 0, 'no duplicates');
   const items = Object.values(lib.d.items).sort((a, b) => a.name.localeCompare(b.name));
   const [one, three, two] = items;
   assert.strictEqual(one.width, 640);
 
-  // identify: sort into folder with NSFW/Very, then undo
+  // sort the original straight away with NSFW/Very, then undo
   const e1 = await lib.sortFile({ kind: 'item', id: one.id }, 'Genshin Impact', { nsfw: true, very: true });
   assert.ok(fs.existsSync(path.join(st.sortRoot, 'Genshin Impact', 'NSFW', 'Very', 'one.jpg')));
-  assert.strictEqual(lib.item(one.id).status, 'sorted');
+  assert.strictEqual(lib.item(one.id).status, 'done');
   await lib.undoSort(e1.id);
   assert.ok(fs.existsSync(path.join(src, 'one.jpg')));
-  assert.notStrictEqual(lib.item(one.id).status, 'sorted');
+  assert.notStrictEqual(lib.item(one.id).status, 'done');
 
-  // upgrade: two downloads, keep one, sort it → done and folder removed
-  lib.setMode(two.id, 'upgrade');
+  // same file: download two versions, keep one, sort it -> done, folder removed
   const folder = lib.itemFolder(lib.item(two.id));
   fs.mkdirSync(folder, { recursive: true });
   const p1 = path.join(folder, 'big.png'), p2 = path.join(folder, 'other.jpg');
@@ -270,27 +272,105 @@ test('library flow: sort, undo, compare-keep, relink, done', async () => {
   assert.strictEqual(lib.item(two.id).phase, 'compare');
   await lib.applyKeep(two.id, [d1.id]);
   assert.ok(!fs.existsSync(p2) && !fs.existsSync(path.join(src, 'two.png')), 'unkept + original recycled');
-  assert.strictEqual(lib.item(two.id).status === 'done', false);
+  assert.notStrictEqual(lib.item(two.id).status, 'done');
   await lib.sortFile({ kind: 'download', id: d1.id }, 'Art', { nsfw: false });
   assert.ok(fs.existsSync(path.join(st.sortRoot, 'Art', 'big.png')));
   assert.strictEqual(lib.item(two.id).status, 'done');
   assert.ok(!fs.existsSync(folder), 'item download folder removed');
 
+  // sort the original AND keep a download: not done until both are sorted
+  const f3 = lib.itemFolder(lib.item(three.id));
+  fs.mkdirSync(f3, { recursive: true });
+  const p3 = path.join(f3, 'v.jpg');
+  fs.copyFileSync(path.join(FX, 'q85.jpg'), p3);
+  const d3 = lib.addDownload({ itemId: three.id, path: p3, name: 'v.jpg' });
+  await lib.finishDownload(d3.id, 'completed');
+  await lib.sortFile({ kind: 'item', id: three.id }, 'Art', {});
+  assert.notStrictEqual(lib.item(three.id).status, 'done', 'download still pending');
+  await lib.sortFile({ kind: 'download', id: d3.id }, 'Art', {});
+  assert.strictEqual(lib.item(three.id).status, 'done');
+
   // stray download: unlinked, then linked to an item, then unlinked again
   const un = lib.unlinkedFolder();
   fs.mkdirSync(un, { recursive: true });
-  const p3 = path.join(un, 'stray.jpg');
-  fs.copyFileSync(path.join(FX, 'q85.jpg'), p3);
-  const d3 = lib.addDownload({ itemId: null, path: p3, name: 'stray.jpg' });
-  await lib.finishDownload(d3.id, 'completed');
-  await lib.relinkDownload(d3.id, three.id);
-  assert.ok(lib.d.downloads[d3.id].path.startsWith(lib.itemFolder(lib.item(three.id))));
-  assert.deepStrictEqual(lib.item(three.id).downloads, [d3.id]);
-  await lib.relinkDownload(d3.id, null);
-  assert.ok(lib.d.downloads[d3.id].path.startsWith(un));
-  assert.deepStrictEqual(lib.item(three.id).downloads, []);
-  assert.ok(!fs.existsSync(lib.itemFolder(lib.item(three.id))), 'emptied item folder removed');
+  const p4 = path.join(un, 'stray.jpg');
+  fs.copyFileSync(path.join(FX, 'q85.jpg'), p4);
+  const d4 = lib.addDownload({ itemId: null, path: p4, name: 'stray.jpg' });
+  await lib.finishDownload(d4.id, 'completed');
+  await lib.relinkDownload(d4.id, one.id);
+  assert.ok(lib.d.downloads[d4.id].path.startsWith(lib.itemFolder(lib.item(one.id))));
+  assert.deepStrictEqual(lib.item(one.id).downloads, [d4.id]);
+  await lib.relinkDownload(d4.id, null);
+  assert.ok(lib.d.downloads[d4.id].path.startsWith(un));
+  assert.deepStrictEqual(lib.item(one.id).downloads, []);
+  assert.ok(!fs.existsSync(lib.itemFolder(lib.item(one.id))), 'emptied item folder removed');
   lib.store.flush();
+});
+
+test('files moved or deleted outside the app are removed and logged', async () => {
+  const { lib, src, st } = makeLib();
+  await lib.addBatch(src, false);
+  const items = Object.values(lib.d.items).sort((a, b) => a.name.localeCompare(b.name));
+  const [one, three, two] = items;
+  // a sorted file, an unlinked download and an original all go missing
+  const e = await lib.sortFile({ kind: 'item', id: one.id }, 'Art', {});
+  const un = lib.unlinkedFolder();
+  fs.mkdirSync(un, { recursive: true });
+  const pu = path.join(un, 'u.jpg');
+  fs.copyFileSync(path.join(FX, 'q85.jpg'), pu);
+  const du = lib.addDownload({ itemId: null, path: pu, name: 'u.jpg' });
+  await lib.finishDownload(du.id, 'completed');
+  // item with a download: original removed but the download keeps it in the app
+  const f = lib.itemFolder(lib.item(two.id));
+  fs.mkdirSync(f, { recursive: true });
+  const pd = path.join(f, 'v.jpg');
+  fs.copyFileSync(path.join(FX, 'q85.jpg'), pd);
+  const dd = lib.addDownload({ itemId: two.id, path: pd, name: 'v.jpg' });
+  await lib.finishDownload(dd.id, 'completed');
+
+  fs.unlinkSync(path.join(st.sortRoot, 'Art', 'one.jpg'));
+  fs.unlinkSync(pu);
+  fs.unlinkSync(path.join(src, 'three.jpg'));
+  fs.unlinkSync(path.join(src, 'two.png'));
+  const n = await lib.checkMissing();
+  assert.ok(n >= 4);
+  assert.ok(!lib.item(three.id), 'original-only item removed');
+  assert.ok(!lib.item(one.id), 'done item whose sorted file vanished removed');
+  assert.ok(lib.item(two.id) && lib.item(two.id).originalMissing, 'item with downloads kept');
+  assert.ok(!lib.d.downloads[du.id], 'vanished download removed');
+  const entry = lib.d.sortLog.find((l) => l.id === e.id);
+  assert.ok(entry.missingAt, 'sort entry marked missing');
+  await assert.rejects(() => lib.undoSort(e.id), /can't be undone/);
+  assert.strictEqual(lib.d.sortLog.filter((l) => l.kind === 'gone').length, 3);
+  // after 30 days the missing lines are purged
+  for (const l of lib.d.sortLog) { if (l.kind === 'gone') l.time -= 31 * 864e5; if (l.missingAt) l.missingAt -= 31 * 864e5; }
+  await lib.checkMissing();
+  assert.strictEqual(lib.d.sortLog.length, 0);
+  // remaining download sorted -> the item is done
+  await lib.sortFile({ kind: 'download', id: dd.id }, 'Art', {});
+  assert.strictEqual(lib.item(two.id).status, 'done');
+  lib.clearLog();
+  assert.strictEqual(lib.d.sortLog.length, 0);
+});
+
+test('retry failed lookups, per site', () => {
+  const { lib } = makeLib();
+  lib.d.items.a = { id: 'a', name: 'a', path: 'x', status: 'looked', engines: { iqdb: 'error', saucenao: 'done', ascii2d: 'blocked' }, results: [], downloads: [] };
+  lib.d.items.b = { id: 'b', name: 'b', path: 'y', status: 'looked', engines: { iqdb: 'done', ascii2d: 'blocked' }, results: [], downloads: [] };
+  assert.deepStrictEqual(lib.failedCounts(), { all: 2, iqdb: 1, saucenao: 0, ascii2d: 2, tracemoe: 0 });
+  assert.strictEqual(lib.requeueFailed('iqdb'), 1);
+  assert.strictEqual(lib.d.items.a.engines.iqdb, undefined);
+  assert.strictEqual(lib.d.items.a.engines.ascii2d, 'blocked');
+  assert.strictEqual(lib.requeueFailed(null), 2);
+  assert.strictEqual(lib.d.items.b.engines.ascii2d, undefined);
+});
+
+const iqdbMod = require('../src/main/lookup/iqdb');
+test('IQDB busy page is retried later, not failed', async () => {
+  const fake = (html, status = 200) => async () => ({ status, ok: status < 400, text: async () => html });
+  await assert.rejects(() => iqdbMod.search(fake('<html><body>IQDB is experiencing heavy load. You are in queue position 12.</body></html>'), { filename: 'a.jpg', mime: 'image/jpeg', buffer: Buffer.alloc(3) }), iqdbMod.BusyError);
+  await assert.rejects(() => iqdbMod.search(fake('', 503), { filename: 'a.jpg', mime: 'image/jpeg', buffer: Buffer.alloc(3) }), iqdbMod.BusyError);
+  await assert.rejects(() => iqdbMod.search(fake('<p>Not an image or image format not supported</p>'), { filename: 'a.jpg', mime: 'image/jpeg', buffer: Buffer.alloc(3) }), /could not read/);
 });
 
 (async () => {

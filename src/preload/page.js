@@ -5,6 +5,12 @@ const { ipcRenderer, webFrame } = require('electron');
 let config = { dark: false, autofill: false };
 try { config = ipcRenderer.sendSync('page:config', location.href) || config; } catch (_) { /* ignore */ }
 
+// ---------- mouse back / forward buttons ----------
+window.addEventListener('mouseup', (e) => {
+  if (e.button === 3) { e.preventDefault(); ipcRenderer.send('page:mousenav', 'back'); }
+  else if (e.button === 4) { e.preventDefault(); ipcRenderer.send('page:mousenav', 'forward'); }
+}, true);
+
 // ---------- dark mode ----------
 if (config.dark && window.top === window) {
   try {

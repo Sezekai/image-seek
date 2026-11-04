@@ -1,5 +1,9 @@
 'use strict';
-// Batches, looked-up items, downloads and the sort log. Files are worked on where they are.
+// Batches, looked-up items, downloads and the log. Files are worked on where they are.
+//
+// One flow per file: you can sort the original straight away, or download better versions,
+// compare them, keep some and sort those. A file is done once its original and every
+// download linked to it have been sorted, recycled, unlinked or gone missing.
 const fs = require('fs');
 const fsp = fs.promises;
 const path = require('path');
@@ -10,6 +14,8 @@ const fo = require('./fileops');
 const { getImageInfo } = require('./imageinfo');
 
 const newId = () => crypto.randomBytes(5).toString('hex');
+const DAY = 24 * 60 * 60 * 1000;
+const LOG_KEEP_MISSING = 30 * DAY;
 
 class Library {
   constructor(paths, settings, emit) {
@@ -17,27 +23,35 @@ class Library {
     this.settings = settings;
     this.emit = emit; // (event, payload)
     this.store = new JsonStore(path.join(paths.data, 'library.json'), {
-      version: 1, batches: [], items: {}, downloads: {}, sortLog: [],
+      version: 2, batches: [], items: {}, downloads: {}, sortLog: [],
     });
-    // Anything left mid-lookup when the app closed goes back to the queue.
-    for (const it of Object.values(this.d.items)) {
-      if (it.status === 'looking') it.status = 'queued';
-    }
+    this.migrate();
+    this.checking = false;
   }
 
   get d() { return this.store.data; }
   save() { this.store.save(); }
-  changed(ids) { this.save(); this.emit('lib:changed', { ids: [].concat(ids || []) }); }
+  changed(ids) { this.save(); this.emit('lib:changed', { ids: [].concat(ids || []).filter(Boolean) }); }
+
+  migrate() {
+    for (const it of Object.values(this.d.items)) {
+      if (it.status === 'looking') it.status = 'queued';
+      if (it.status === 'sorted') { it.status = 'done'; it.originalSorted = true; }
+      if (it.engines) for (const [k, v] of Object.entries(it.engines)) if (v === 'waiting' && k !== 'saucenao' && !(it.retryAt && it.retryAt[k])) it.engines[k] = undefined;
+    }
+    this.d.version = 2;
+  }
 
   // ---------- summaries for the UI ----------
   summary(it) {
     return {
-      id: it.id, batchId: it.batchId, path: it.path, name: it.name, mode: it.mode, status: it.status,
-      phase: it.phase, width: it.width, height: it.height, size: it.size, format: it.format,
+      id: it.id, batchId: it.batchId, path: it.path, name: it.name, status: it.status, phase: it.phase,
+      width: it.width, height: it.height, size: it.size, format: it.format,
       guess: it.guess || null, bigger: it.bigger || null, error: it.error || null,
-      engines: it.engines || {}, downloads: (it.downloads || []).length, keep: it.keep || null,
+      engines: it.engines || {}, downloads: (it.downloads || []).length,
+      pendingDownloads: this.pendingDownloads(it).length, keep: it.keep || null,
       resultCount: (it.results || []).length, addedAt: it.addedAt, doneAt: it.doneAt || null,
-      sortedTo: it.sortedTo || null,
+      sortedTo: it.sortedTo || null, originalGone: this.originalGone(it), originalSorted: !!it.originalSorted,
     };
   }
 
@@ -46,7 +60,15 @@ class Library {
       batches: this.d.batches.map((b) => ({ ...b, counts: this.batchCounts(b.id) })),
       items: Object.values(this.d.items).map((it) => this.summary(it)),
       downloads: Object.values(this.d.downloads),
-      sortLog: this.d.sortLog.slice(-500),
+      sortLog: this.d.sortLog.slice(-1500),
+    };
+  }
+
+  light() {
+    return {
+      batches: this.d.batches.map((b) => ({ ...b, counts: this.batchCounts(b.id) })),
+      downloads: Object.values(this.d.downloads),
+      sortLog: this.d.sortLog.slice(-1500),
     };
   }
 
@@ -57,7 +79,7 @@ class Library {
       c.total++;
       if (it.status === 'queued' || it.status === 'looking') c.queued++;
       else if (it.status === 'looked') c.looked++;
-      else if (it.status === 'done' || it.status === 'sorted') c.done++;
+      else if (it.status === 'done') c.done++;
       else if (it.status === 'error') c.error++;
     }
     return c;
@@ -65,16 +87,18 @@ class Library {
 
   item(id) { return this.d.items[id] || null; }
 
+  originalGone(it) { return !!(it.originalRecycled || it.originalMissing); }
+
   // ---------- batches ----------
-  async addBatch(folder, mode, recursive) {
+  async addBatch(folder, recursive) {
     const files = await fo.listImages(folder, recursive);
-    const known = new Set(Object.values(this.d.items).filter((i) => i.status !== 'done' && i.status !== 'sorted').map((i) => i.path.toLowerCase()));
-    const batch = { id: newId(), folder, mode, recursive: !!recursive, created: Date.now(), name: path.basename(folder) };
+    const known = new Set(Object.values(this.d.items).filter((i) => i.status !== 'done').map((i) => i.path.toLowerCase()));
+    const batch = { id: newId(), folder, recursive: !!recursive, created: Date.now(), name: path.basename(folder) || folder };
     let added = 0;
     for (const f of files) {
       if (known.has(f.toLowerCase())) continue;
       const it = {
-        id: newId(), batchId: batch.id, path: f, name: path.basename(f), mode,
+        id: newId(), batchId: batch.id, path: f, name: path.basename(f),
         status: 'queued', phase: 'lookup', engines: {}, results: [], downloads: [], addedAt: Date.now(),
       };
       try { Object.assign(it, pickInfo(await getImageInfo(f))); } catch (_) { /* unreadable header */ }
@@ -89,28 +113,61 @@ class Library {
 
   removeBatch(batchId) {
     for (const [id, it] of Object.entries(this.d.items)) {
-      if (it.batchId === batchId && (it.downloads || []).length === 0) delete this.d.items[id];
-      else if (it.batchId === batchId) it.batchId = null;
+      if (it.batchId !== batchId) continue;
+      if ((it.downloads || []).length === 0) delete this.d.items[id];
+      else it.batchId = null;
     }
     this.d.batches = this.d.batches.filter((b) => b.id !== batchId);
     this.changed([]);
   }
 
-  setMode(id, mode) {
-    const it = this.item(id);
-    if (!it) return;
-    it.mode = mode;
-    this.changed(id);
+  // Drop batches that no longer have any files listed.
+  pruneBatches() {
+    const used = new Set(Object.values(this.d.items).map((i) => i.batchId));
+    const before = this.d.batches.length;
+    this.d.batches = this.d.batches.filter((b) => used.has(b.id));
+    return before !== this.d.batches.length;
   }
 
   requeue(id, engines) {
     const it = this.item(id);
     if (!it) return;
-    if (engines && engines.length) for (const e of engines) delete it.engines[e];
-    else { it.engines = {}; it.results = []; }
-    it.status = 'queued';
+    if (engines && engines.length) {
+      for (const e of engines) {
+        delete it.engines[e];
+        if (it.retryAt) delete it.retryAt[e];
+        if (it.engineErrors) delete it.engineErrors[e];
+      }
+    } else { it.engines = {}; it.results = []; it.retryAt = {}; it.engineErrors = {}; }
+    if (it.status !== 'done') it.status = 'queued';
     it.error = null;
     this.changed(id);
+  }
+
+  // Requeue every failed / blocked lookup, optionally for one engine only. Returns how many files.
+  requeueFailed(engine) {
+    let n = 0;
+    for (const it of Object.values(this.d.items)) {
+      if (it.status === 'done') continue;
+      const bad = Object.entries(it.engines || {}).filter(([k, v]) => (v === 'error' || v === 'blocked') && (!engine || k === engine)).map(([k]) => k);
+      if (it.status === 'error' && !engine && !bad.length) { this.requeue(it.id); n++; continue; }
+      if (bad.length) { this.requeue(it.id, bad); n++; }
+    }
+    this.changed([]);
+    return n;
+  }
+
+  failedCounts() {
+    const c = { all: 0, iqdb: 0, saucenao: 0, ascii2d: 0, tracemoe: 0 };
+    for (const it of Object.values(this.d.items)) {
+      if (it.status === 'done') continue;
+      let any = it.status === 'error';
+      for (const [k, v] of Object.entries(it.engines || {})) {
+        if (v === 'error' || v === 'blocked') { c[k] = (c[k] || 0) + 1; any = true; }
+      }
+      if (any) c.all++;
+    }
+    return c;
   }
 
   // ---------- item folder for linked downloads ----------
@@ -127,11 +184,12 @@ class Library {
     const id = newId();
     const dl = { id, time: Date.now(), state: 'progress', ...rec };
     this.d.downloads[id] = dl;
-    if (dl.itemId && this.d.items[dl.itemId]) {
-      const it = this.d.items[dl.itemId];
+    const it = dl.itemId && this.d.items[dl.itemId];
+    if (it) {
       it.downloads = it.downloads || [];
       it.downloads.push(id);
-      if (it.mode === 'upgrade' && it.phase === 'lookup') it.phase = 'compare';
+      if (it.phase !== 'sort') it.phase = 'compare';
+      if (it.status === 'done') { it.status = 'looked'; it.doneAt = null; }
     }
     this.changed(dl.itemId || []);
     return dl;
@@ -147,6 +205,8 @@ class Library {
     } else {
       this.detachDownload(dl);
       delete this.d.downloads[id];
+      const it = dl.itemId && this.item(dl.itemId);
+      if (it) await this.checkItemDone(it);
     }
     this.changed(dl.itemId || []);
     this.emit('dl:finished', { id, state });
@@ -164,6 +224,7 @@ class Library {
       const it = this.d.items[dl.itemId];
       it.downloads = (it.downloads || []).filter((x) => x !== dl.id);
       if (it.keep) it.keep = it.keep.filter((x) => x !== dl.id);
+      if (!it.downloads.length && it.phase === 'compare') it.phase = 'lookup';
     }
   }
 
@@ -176,14 +237,17 @@ class Library {
     if (await fo.exists(dl.path)) dl.path = await fo.moveFile(dl.path, destDir);
     this.detachDownload(dl);
     dl.itemId = target ? target.id : null;
+    dl.dist = undefined;
     if (target) {
       target.downloads = target.downloads || [];
       target.downloads.push(dl.id);
-      if (target.phase === 'lookup') target.phase = 'compare';
-      if (target.status === 'done') target.status = 'looked';
+      if (target.phase !== 'sort') target.phase = 'compare';
+      if (target.status === 'done') { target.status = 'looked'; target.doneAt = null; }
     }
     await this.cleanupItemFolder(oldItem);
-    this.changed([oldItem, itemId].filter(Boolean));
+    const old = oldItem && this.item(oldItem);
+    if (old) await this.checkItemDone(old);
+    this.changed([oldItem, itemId]);
   }
 
   async recycleDownload(id) {
@@ -193,6 +257,8 @@ class Library {
     this.detachDownload(dl);
     delete this.d.downloads[id];
     await this.cleanupItemFolder(dl.itemId);
+    const it = dl.itemId && this.item(dl.itemId);
+    if (it) await this.checkItemDone(it);
     this.changed(dl.itemId || []);
   }
 
@@ -201,139 +267,155 @@ class Library {
     const it = this.item(itemId);
     if (!it) throw new Error('Item not found');
     const keep = new Set(keepIds);
-    const recycled = [];
-    if (!keep.has('original')) {
-      if (await fo.exists(it.path)) { await shell.trashItem(it.path); recycled.push(it.path); }
+    let recycled = 0;
+    if (!keep.has('original') && !this.originalGone(it) && !it.originalSorted) {
+      if (await fo.exists(it.path)) { await shell.trashItem(it.path); recycled++; }
       it.originalRecycled = true;
     }
     for (const dlId of [...(it.downloads || [])]) {
       if (keep.has(dlId)) continue;
       const dl = this.d.downloads[dlId];
-      if (dl && await fo.exists(dl.path)) { await shell.trashItem(dl.path); recycled.push(dl.path); }
-      if (dl) delete this.d.downloads[dlId];
+      if (!dl || dl.sortedTo || dl.state !== 'completed') continue;
+      if (await fo.exists(dl.path)) { await shell.trashItem(dl.path); recycled++; }
+      delete this.d.downloads[dlId];
       it.downloads = it.downloads.filter((x) => x !== dlId);
     }
     it.keep = [...keep];
     it.phase = 'sort';
     await this.checkItemDone(it);
     this.changed(itemId);
-    return { recycled: recycled.length };
+    return { recycled };
   }
 
-  // Things still waiting to be sorted for an upgrade item after Compare.
-  pendingKept(it) {
+  // Downloads linked to an item that still need sorting (or comparing).
+  pendingDownloads(it) {
+    return (it.downloads || []).map((id) => this.d.downloads[id]).filter((d) => d && !d.sortedTo);
+  }
+
+  // Everything still waiting to be dealt with for this item.
+  pending(it) {
     const out = [];
-    if ((it.keep || []).includes('original') && !it.originalSorted && !it.originalRecycled) out.push('original');
-    for (const dlId of it.keep || []) {
-      if (dlId === 'original') continue;
-      const dl = this.d.downloads[dlId];
-      if (dl && !dl.sortedTo) out.push(dlId);
-    }
+    if (!it.originalSorted && !this.originalGone(it)) out.push('original');
+    for (const d of this.pendingDownloads(it)) out.push(d.id);
     return out;
   }
 
   async checkItemDone(it) {
-    if (it.mode !== 'upgrade' || it.phase !== 'sort') return;
-    if (this.pendingKept(it).length === 0) {
-      await this.cleanupItemFolder(it.id, true);
-      it.status = 'done';
-      it.doneAt = Date.now();
+    if (!it) return;
+    if (this.pending(it).length === 0) {
+      if (it.status !== 'done') { it.status = 'done'; it.doneAt = Date.now(); }
+      await this.cleanupItemFolder(it.id);
+    } else if (it.status === 'done') {
+      it.status = (it.results || []).length || Object.keys(it.engines || {}).length ? 'looked' : 'queued';
+      it.doneAt = null;
     }
   }
 
-  async cleanupItemFolder(itemId, force) {
+  async cleanupItemFolder(itemId) {
     if (!itemId) return;
     const it = this.item(itemId);
     if (!it) return;
     const dir = this.itemFolder(it);
     if (await fo.isDirEmpty(dir)) {
       try { await fsp.rmdir(dir); } catch (_) { /* in use */ }
-    } else if (force) {
-      // Only remove if nothing in it belongs to a live download.
-      const live = Object.values(this.d.downloads).some((d) => d.path && d.path.startsWith(dir + path.sep));
-      if (!live && await fo.isDirEmpty(dir)) { try { await fsp.rmdir(dir); } catch (_) { /* ignore */ } }
     }
   }
 
   // ---------- sorting ----------
-  // target: { kind: 'item' | 'download', id, sub } ; dest folder is relative to sort root
+  // target: { kind: 'item' | 'download', id } ; destRel is relative to the sort folder
   async sortFile(target, destRel, flags) {
     const s = this.settings.get();
     const parts = [s.sortRoot, ...destRel.split(/[\\/]/).filter(Boolean)];
     if (flags && flags.nsfw) parts.push('NSFW');
     if (flags && flags.nsfw && flags.very) parts.push('Very');
     const destDir = path.join(...parts);
-    let src, logEntry;
+    let logEntry;
     if (target.kind === 'item') {
       const it = this.item(target.id);
       if (!it) throw new Error('Item not found');
-      src = it.path;
+      if (it.originalSorted || this.originalGone(it)) throw new Error('The original has already been dealt with');
+      const src = it.path;
       const dest = await fo.moveFile(src, destDir);
-      logEntry = { id: newId(), time: Date.now(), kind: 'item', refId: it.id, from: src, to: dest, folder: destRel, flags, prev: { status: it.status, path: it.path } };
+      logEntry = { id: newId(), time: Date.now(), kind: 'item', refId: it.id, name: it.name, from: src, to: dest, folder: destRel, flags };
       it.path = dest;
       it.sortedTo = destRel;
-      if (it.mode === 'identify') { it.status = 'sorted'; it.doneAt = Date.now(); }
-      else { it.originalSorted = true; await this.checkItemDone(it); }
+      it.originalSorted = true;
+      await this.checkItemDone(it);
       this.changed(it.id);
     } else {
       const dl = this.d.downloads[target.id];
       if (!dl) throw new Error('Download not found');
-      src = dl.path;
+      const src = dl.path;
       const dest = await fo.moveFile(src, destDir);
-      logEntry = { id: newId(), time: Date.now(), kind: 'download', refId: dl.id, from: src, to: dest, folder: destRel, flags, prev: { path: dl.path, itemId: dl.itemId } };
       dl.path = dest;
       dl.sortedTo = destRel;
+      logEntry = { id: newId(), time: Date.now(), kind: 'download', refId: dl.id, name: dl.name, from: src, to: dest, folder: destRel, flags, download: { ...dl } };
       const it = dl.itemId && this.item(dl.itemId);
       if (it) {
-        // A kept download is sorted: it stays recorded on the item until the item is done.
-        if (!it.keep || it.phase !== 'sort') {
-          // Sorted straight from the Downloads section: unlink it from the item.
-          this.detachDownload(dl);
-          dl.itemId = null;
-          delete this.d.downloads[dl.id];
-        }
         await this.cleanupItemFolder(it.id);
         await this.checkItemDone(it);
+        // Keep the record while the item is still open (Compare shows it); drop it once done.
+        if (it.status === 'done') this.dropSortedDownloads(it);
         this.changed(it.id);
       } else {
         delete this.d.downloads[dl.id];
-        this.changed([]);
       }
-      logEntry.download = { ...dl };
     }
-    this.d.sortLog.push(logEntry);
-    if (this.d.sortLog.length > 5000) this.d.sortLog.splice(0, this.d.sortLog.length - 5000);
+    this.pushLog(logEntry);
     this.changed([]);
     return logEntry;
   }
 
+  dropSortedDownloads(it) {
+    for (const id of [...(it.downloads || [])]) {
+      const d = this.d.downloads[id];
+      if (d && d.sortedTo) delete this.d.downloads[id];
+    }
+    it.downloads = (it.downloads || []).filter((id) => this.d.downloads[id]);
+  }
+
+  pushLog(entry) {
+    this.d.sortLog.push(entry);
+    if (this.d.sortLog.length > 5000) this.d.sortLog.splice(0, this.d.sortLog.length - 5000);
+  }
+
   async undoSort(logId) {
-    const idx = this.d.sortLog.findIndex((l) => l.id === logId);
-    if (idx < 0) throw new Error('Log entry not found');
-    const l = this.d.sortLog[idx];
+    const l = this.d.sortLog.find((x) => x.id === logId);
+    if (!l) throw new Error('Log entry not found');
     if (l.undone) throw new Error('Already undone');
+    if (l.missingAt || l.kind === 'gone') throw new Error('That file was moved or deleted outside Image Seek, so it can\'t be undone');
+    if (!(await fo.exists(l.to))) {
+      l.missingAt = Date.now();
+      this.changed([]);
+      throw new Error('The sorted file is no longer there, so it can\'t be moved back');
+    }
     await fo.moveToExact(l.to, l.from);
     if (l.kind === 'item') {
       const it = this.item(l.refId);
       if (it) {
         it.path = l.from;
         it.sortedTo = null;
-        if (it.mode === 'identify') { it.status = l.prev.status === 'sorted' ? 'looked' : l.prev.status; it.doneAt = null; }
-        else { it.originalSorted = false; if (it.status === 'done') { it.status = 'looked'; it.doneAt = null; } }
+        it.originalSorted = false;
+        await this.checkItemDone(it);
         this.changed(it.id);
       }
     } else {
-      const dl = { ...(l.download || {}), path: l.from, sortedTo: null, itemId: l.prev.itemId || null };
-      dl.id = l.refId;
-      this.d.downloads[dl.id] = dl;
+      const dl = { ...(l.download || {}), id: l.refId, path: l.from, sortedTo: null };
       const it = dl.itemId && this.item(dl.itemId);
+      if (!it) dl.itemId = null;
+      this.d.downloads[dl.id] = dl;
       if (it) {
         if (!(it.downloads || []).includes(dl.id)) it.downloads.push(dl.id);
-        if (it.status === 'done') { it.status = 'looked'; it.doneAt = null; }
+        await this.checkItemDone(it);
         this.changed(it.id);
       }
     }
     l.undone = true;
+    this.changed([]);
+  }
+
+  clearLog() {
+    this.d.sortLog = [];
     this.changed([]);
   }
 
@@ -342,12 +424,8 @@ class Library {
     if (!it) return;
     if (await fo.exists(it.path)) await shell.trashItem(it.path);
     it.originalRecycled = true;
-    if (it.mode === 'identify' || (it.downloads || []).length === 0) {
-      it.status = 'done';
-      it.doneAt = Date.now();
-    } else {
-      it.keep = (it.keep || []).filter((k) => k !== 'original');
-    }
+    if (it.keep) it.keep = it.keep.filter((k) => k !== 'original');
+    await this.checkItemDone(it);
     this.changed(id);
   }
 
@@ -356,18 +434,123 @@ class Library {
     if (!it) return;
     for (const dlId of it.downloads || []) {
       const dl = this.d.downloads[dlId];
-      if (dl) dl.itemId = null;
+      if (dl) { if (dl.sortedTo) delete this.d.downloads[dlId]; else dl.itemId = null; }
     }
     delete this.d.items[id];
+    this.pruneBatches();
     this.changed([]);
   }
 
   clearDone() {
     for (const [id, it] of Object.entries(this.d.items)) {
-      if (it.status === 'done' || it.status === 'sorted') delete this.d.items[id];
+      if (it.status !== 'done') continue;
+      this.dropSortedDownloads(it);
+      delete this.d.items[id];
     }
+    this.pruneBatches();
     this.changed([]);
   }
+
+  // ---------- files moved or deleted outside the app ----------
+  // Anything that has disappeared is removed from the app and noted in the log. Those log
+  // lines (and sort entries whose file is gone) are dropped after 30 days.
+  async checkMissing() {
+    if (this.checking) return 0;
+    this.checking = true;
+    let changes = 0;
+    const touched = new Set();
+    try {
+      const jobs = [];
+      const gone = (kind, name, p, extra) => {
+        this.pushLog({ id: newId(), time: Date.now(), kind: 'gone', what: kind, name, from: p, to: null, ...extra });
+        changes++;
+      };
+      // originals still in their lookup folder
+      for (const it of Object.values(this.d.items)) {
+        if (it.status === 'done' && !it.originalSorted) continue;
+        if (this.originalGone(it)) continue;
+        jobs.push(async () => {
+          if (await fo.exists(it.path)) return;
+          if (!this.d.items[it.id]) return;
+          if (it.originalSorted) {
+            // A sorted original that's gone: its log entry is marked below; forget the done item.
+            if (it.status === 'done') { delete this.d.items[it.id]; changes++; }
+            return;
+          }
+          gone('original', it.name, it.path);
+          it.originalMissing = true;
+          touched.add(it.id);
+          const anyDownloads = (it.downloads || []).some((id) => this.d.downloads[id] && !this.d.downloads[id].sortedTo);
+          if (!anyDownloads) { this.forgetItemQuiet(it); }
+          else await this.checkItemDone(it);
+        });
+      }
+      // downloads (linked and unlinked) waiting to be dealt with
+      for (const dl of Object.values(this.d.downloads)) {
+        if (dl.state !== 'completed' || dl.sortedTo) continue;
+        jobs.push(async () => {
+          if (await fo.exists(dl.path)) return;
+          if (!this.d.downloads[dl.id]) return;
+          gone(dl.itemId ? 'download' : 'unlinked', dl.name || path.basename(dl.path), dl.path);
+          this.detachDownload(dl);
+          delete this.d.downloads[dl.id];
+          const it = dl.itemId && this.item(dl.itemId);
+          if (it) {
+            touched.add(it.id);
+            await this.cleanupItemFolder(it.id);
+            if (this.originalGone(it) && !this.pendingDownloads(it).length && !it.originalSorted && !(it.downloads || []).length) this.forgetItemQuiet(it);
+            else await this.checkItemDone(it);
+          }
+        });
+      }
+      // sorted files
+      for (const l of this.d.sortLog) {
+        if (l.kind === 'gone' || l.undone || l.missingAt) continue;
+        jobs.push(async () => {
+          if (await fo.exists(l.to)) return;
+          l.missingAt = Date.now();
+          changes++;
+          if (l.kind === 'download' && this.d.downloads[l.refId] && this.d.downloads[l.refId].sortedTo) {
+            const dl = this.d.downloads[l.refId];
+            this.detachDownload(dl);
+            delete this.d.downloads[l.refId];
+          }
+          if (l.kind === 'item') {
+            const it = this.item(l.refId);
+            if (it && it.status === 'done' && it.path === l.to) delete this.d.items[it.id];
+          }
+        });
+      }
+      await runLimited(jobs, 24);
+      // purge old missing / gone lines
+      const now = Date.now();
+      const before = this.d.sortLog.length;
+      this.d.sortLog = this.d.sortLog.filter((l) => {
+        const t = l.kind === 'gone' ? l.time : l.missingAt;
+        return !t || now - t < LOG_KEEP_MISSING;
+      });
+      if (this.d.sortLog.length !== before) changes++;
+      if (this.pruneBatches()) changes++;
+    } finally {
+      this.checking = false;
+    }
+    if (changes) this.changed([]);
+    return changes;
+  }
+
+  forgetItemQuiet(it) {
+    for (const dlId of it.downloads || []) {
+      const dl = this.d.downloads[dlId];
+      if (dl) { if (dl.sortedTo) delete this.d.downloads[dlId]; else dl.itemId = null; }
+    }
+    delete this.d.items[it.id];
+  }
+}
+
+async function runLimited(jobs, n) {
+  let i = 0;
+  const worker = async () => { while (i < jobs.length) { const j = jobs[i++]; try { await j(); } catch (_) { /* ignore */ } } };
+  await Promise.all(Array.from({ length: Math.min(n, jobs.length) }, worker));
 }
 
 function pickInfo(info) {
@@ -377,4 +560,4 @@ function pickInfo(info) {
   };
 }
 
-module.exports = { Library, newId };
+module.exports = { Library, newId, LOG_KEEP_MISSING };

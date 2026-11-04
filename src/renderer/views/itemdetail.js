@@ -1,13 +1,13 @@
-// Detail panel for one looked-up file: preview, best guess, matches, manual search buttons,
-// and either the sort panel (identify) or its linked downloads (higher resolution).
+// Info panel for one looked-up file: preview, best guess, downloaded versions, sorting,
+// manual search buttons and every engine's matches.
 import {
-  api, state, h, icon, btn, seg, clear, fmtBytes, fmtDims, fmtMp, thumbUrl, fileUrl, basename, dirname,
-  simClass, ENGINE_LABEL, toast, emit, viewImage, confirmBox, hostOf,
+  api, state, h, icon, btn, clear, fmtBytes, fmtDims, fmtMp, thumbUrl, fileUrl, basename, dirname,
+  simClass, ENGINE_LABEL, toast, emit, viewImage, confirmBox, hostOf, lsGet, lsSet,
 } from '../core.js';
 import { createSortPanel } from '../sortpanel.js';
 
 const ENGINE_STATE = {
-  done: ['green', 'done'], error: ['red', 'failed'], blocked: ['warn', 'blocked'], waiting: ['warn', 'waiting for quota'],
+  done: ['green', 'done'], error: ['red', 'failed'], blocked: ['warn', 'blocked'], waiting: ['warn', 'retrying later'],
   skipped: ['', 'skipped'], undefined: ['', 'queued'],
 };
 
@@ -21,7 +21,7 @@ export const SEARCH_SITES = [
 
 export function searchButtons(getPath, getItemId) {
   return h('div', { class: 'search-btns' }, SEARCH_SITES.map((s) => {
-    const b = btn(s.label, { icon: s.icon, title: `Click to search in the app's browser, or drag this button onto a web page to drop the file there` });
+    const b = btn(s.label, { icon: s.icon, title: 'Click to search in a new browser tab, or drag this button onto a web page to drop the file there' });
     b.setAttribute('draggable', 'true');
     b.addEventListener('dragstart', (e) => { e.preventDefault(); const p = getPath(); if (p) api.startDrag(p); });
     b.addEventListener('click', () => { const p = getPath(); if (p) emit('search-in-tab', { engine: s.engine, path: p, itemId: getItemId() }); });
@@ -34,8 +34,10 @@ export class ItemDetail {
     this.el = container;
     this.item = null;
     this.sortPanel = null;
-    this.keptSel = null;
+    this.target = null;
+    this.renderedId = null;
     this.showWeak = new Set();
+    this.collapsed = new Set(lsGet('collapsed-engines', []));
   }
 
   async show(id) {
@@ -51,34 +53,35 @@ export class ItemDetail {
   keydown(e) { return this.sortPanel ? this.sortPanel.api.key(e) : false; }
 
   render() {
-    const prevScroll = this.el.querySelector('.scroll') ? this.el.querySelector('.scroll').scrollTop : 0;
+    const old = this.el.querySelector('.scroll');
+    // Keep the scroll position only when the same file is being refreshed.
+    const sameItem = this.item && this.renderedId === this.item.id;
+    const prevScroll = sameItem && old ? old.scrollTop : 0;
+    if (!sameItem) { this.showWeak.clear(); this.target = null; }
     if (this.sortPanel) { this.sortPanel.api.destroy(); this.sortPanel = null; }
     clear(this.el);
     const it = this.item;
+    this.renderedId = it ? it.id : null;
     if (!it) {
       this.el.appendChild(h('div', { class: 'empty', style: { flex: 1 } }, icon('image'), h('div', null, 'Select a file to see its matches')));
       return;
     }
-    const summary = state.items.get(it.id) || it;
+    const gone = !!(it.originalRecycled || it.originalMissing);
     const scroll = h('div', { class: 'scroll' });
 
     // ---- head
-    const modeSeg = seg([
-      { value: 'identify', label: 'Identify', title: 'Find out what it is, then sort it' },
-      { value: 'upgrade', label: 'Higher res', title: 'Find and download better versions, then compare' },
-    ], it.mode, (m) => api.call('item:mode', it.id, m));
     this.el.appendChild(h('div', { class: 'detail-head' },
       h('span', { class: 'dot ' + it.status }),
       h('div', { class: 'name ell grow', title: it.path }, it.name),
-      modeSeg,
+      it.status === 'done' ? h('span', { class: 'chip green' }, icon('check'), 'Done') : null,
       btn('', { icon: 'folder', cls: 'sm icon ghost', title: 'Show in folder', onclick: () => api.call('shell:show', it.path) }),
       btn('', { icon: 'reload', cls: 'sm icon ghost', title: 'Look up again', onclick: () => api.call('item:requeue', it.id).then(() => toast('Queued again')) }),
-      btn('', { icon: 'trash', cls: 'sm icon ghost danger', title: 'Send file to the Recycle Bin', onclick: () => this.recycle() })));
+      gone || it.originalSorted ? null : btn('', { icon: 'trash', cls: 'sm icon ghost danger', title: 'Send the original to the Recycle Bin', onclick: () => this.recycle() })));
 
     // ---- preview
-    const gone = it.originalRecycled;
     const pv = h('div', { class: 'preview', onclick: () => !gone && viewImage(fileUrl(it.path)) },
-      gone ? h('div', { class: 'dim' }, 'Original sent to the Recycle Bin') : h('img', { src: thumbUrl(it.path, 900), draggable: 'false' }));
+      gone ? h('div', { class: 'dim' }, it.originalMissing ? 'The original was moved or deleted outside Image Seek' : 'Original sent to the Recycle Bin')
+        : h('img', { src: thumbUrl(it.path, 900), draggable: 'false' }));
     if (!gone) {
       const dh = btn('Drag file', { icon: 'hand', cls: 'sm drag-handle', title: 'Drag onto a web page (e.g. Google Images) to search with it' });
       dh.setAttribute('draggable', 'true');
@@ -108,80 +111,81 @@ export class ItemDetail {
     const g = it.guess || { series: [], characters: [], artists: [] };
     const group = (label, list, kind) => h('div', { class: 'guess-group' }, h('div', { class: 'lbl' }, label),
       h('div', { class: 'vals' }, list.length ? list.map((v, i) => h('button', {
-        class: 'chip' + (i === 0 ? ' green' : ''), title: `Score ${v.score} · ${v.sources.join(', ')}${kind === 'series' ? ' — click to filter sort folders' : ''}`,
-        onclick: () => { if (this.sortPanel) this.sortPanel.api.setFilter(v.name); navigator.clipboard.writeText(v.name).catch(() => {}); },
+        class: 'chip' + (i === 0 ? ' green' : ''), title: `Score ${v.score} · ${v.sources.join(', ')}${kind === 'series' ? ' — click to filter sort folders' : ' — click to copy'}`,
+        onclick: () => { if (this.sortPanel && kind === 'series') this.sortPanel.api.setFilter(v.name); navigator.clipboard.writeText(v.name).catch(() => {}); },
       }, v.name)) : h('span', { class: 'dim xs' }, it.status === 'queued' || it.status === 'looking' ? '…' : 'unknown')));
     scroll.appendChild(h('div', { class: 'section' }, h('h3', null, 'Best guess'),
       group('Series', g.series, 'series'), group('Characters', g.characters, 'char'), group('Artist', g.artists, 'artist')));
 
-    // ---- downloads (upgrade) or sort (identify)
-    if (it.mode === 'upgrade') scroll.appendChild(this.renderUpgrade(it));
-    else if (it.status !== 'sorted' && it.status !== 'done' && !gone) {
-      this.sortPanel = createSortPanel({ target: () => ({ kind: 'item', id: it.id }), compact: true, onSorted: () => emit('item-sorted', it.id) });
-      scroll.appendChild(h('div', { class: 'section' }, h('h3', null, 'Sort into', h('span', { class: 'grow' }), h('span', { class: 'dim', style: { textTransform: 'none', letterSpacing: 0 } }, '1–9 · N · V')), this.sortPanel));
-    }
+    // ---- downloaded versions + sorting
+    scroll.appendChild(this.renderVersions(it));
+    if (it.status !== 'done') scroll.appendChild(this.renderSort(it));
 
     // ---- manual search
     scroll.appendChild(h('div', { class: 'section' }, h('h3', null, 'Search manually'),
       gone ? h('div', { class: 'dim xs' }, 'The original is gone, so manual search is unavailable.') : searchButtons(() => it.path, () => it.id)));
 
     // ---- results
-    scroll.appendChild(this.renderResults(it, summary));
+    scroll.appendChild(this.renderResults(it));
     this.el.appendChild(scroll);
     scroll.scrollTop = prevScroll;
   }
 
-  renderUpgrade(it) {
+  versions(it) {
+    return (it.downloads || []).map((id) => state.downloads.get(id)).filter((d) => d && !d.sortedTo);
+  }
+
+  renderVersions(it) {
     const sec = h('div', { class: 'section' });
-    const dls = (it.downloads || []).map((id) => state.downloads.get(id)).filter(Boolean);
+    const dls = this.versions(it);
     sec.appendChild(h('h3', null, `Downloaded versions (${dls.length})`, h('span', { class: 'grow' }),
-      dls.length ? btn('Compare', { icon: 'compare', cls: 'sm primary', onclick: () => emit('open-compare', it.id) }) : null));
+      dls.some((d) => d.state === 'completed') ? btn('Compare', { icon: 'compare', cls: 'sm primary', onclick: () => emit('open-compare', it.id) }) : null));
     if (!dls.length) {
-      sec.appendChild(h('div', { class: 'dim xs' }, 'Open a match below (or search manually), then download or right-click → Save image. Downloads from tabs opened for this file are saved and linked here automatically.'));
-    } else {
-      for (const d of dls) {
-        const flagged = d.dist != null && d.dist > (state.settings.unrelatedThreshold || 20);
-        const bigger = d.width && it.width && d.width * d.height > it.width * it.height;
-        sec.appendChild(h('div', { class: 'list-row', style: { padding: '5px 0', borderBottom: '0' } },
-          h('img', { class: 'th', src: thumbUrl(d.path, 160), onclick: () => viewImage(fileUrl(d.path)) }),
-          h('div', { class: 'grow col', style: { gap: '1px' } },
-            h('div', { class: 'ell small' }, d.name || basename(d.path)),
-            h('div', { class: 'xs dim' }, `${fmtDims(d.width, d.height)} · ${fmtBytes(d.size)} · ${hostOf(d.pageUrl || d.url)}`)),
-          d.state === 'progress' ? h('span', { class: 'chip blue' }, 'downloading') : null,
-          bigger ? h('span', { class: 'chip green' }, 'larger') : null,
-          flagged ? h('span', { class: 'chip warn', title: 'Looks like a different picture' }, 'unrelated?') : null,
-          d.sortedTo ? h('span', { class: 'chip' }, 'sorted') : null));
-      }
+      sec.appendChild(h('div', { class: 'dim xs' }, 'Open a match below (or search manually). Anything you download in a tab opened from here, or save with right-click → Save image, is linked to this file.'));
+      return sec;
     }
-    // Kept files waiting to be sorted after Compare.
-    if (it.phase === 'sort') {
-      const pending = [];
-      if ((it.keep || []).includes('original') && !it.originalSorted && !it.originalRecycled) pending.push({ kind: 'item', id: it.id, label: 'Original', path: it.path });
-      for (const k of it.keep || []) {
-        if (k === 'original') continue;
-        const d = state.downloads.get(k);
-        if (d && !d.sortedTo) pending.push({ kind: 'download', id: d.id, label: d.name || basename(d.path), path: d.path });
-      }
-      if (pending.length) {
-        if (!this.keptSel || !pending.find((p) => p.id === this.keptSel.id && p.kind === this.keptSel.kind)) this.keptSel = pending[0];
-        const list = h('div', { class: 'col', style: { gap: '4px', margin: '10px 0 8px' } }, h('div', { class: 'xs muted' }, 'Kept — choose one, then a folder:'),
-          pending.map((p) => h('label', { class: 'check' }, h('input', {
-            type: 'radio', name: 'keptsel', checked: this.keptSel.id === p.id && this.keptSel.kind === p.kind,
-            onchange: () => { this.keptSel = p; },
-          }), h('img', { src: thumbUrl(p.path, 120), style: { width: '30px', height: '30px', objectFit: 'cover', borderRadius: '5px' } }), h('span', { class: 'ell' }, p.label))));
-        sec.appendChild(list);
-        this.sortPanel = createSortPanel({ target: () => this.keptSel && { kind: this.keptSel.kind, id: this.keptSel.id }, compact: true, onSorted: () => emit('item-sorted', it.id) });
-        sec.appendChild(this.sortPanel);
-      }
-    } else if (!it.originalRecycled && it.status !== 'done' && dls.length === 0) {
-      sec.appendChild(h('details', { style: { marginTop: '8px' } }, h('summary', { class: 'xs muted', style: { cursor: 'pointer' } }, 'Nothing better found? Sort the original'),
-        h('div', { style: { marginTop: '8px' } }, (this.sortPanel = createSortPanel({ target: () => ({ kind: 'item', id: it.id }), compact: true, onSorted: () => emit('item-sorted', it.id) })))));
+    for (const d of dls) {
+      const flagged = d.dist != null && d.dist > (state.settings.unrelatedThreshold || 20);
+      const bigger = d.width && it.width && d.width * d.height > it.width * it.height;
+      sec.appendChild(h('div', { class: 'list-row', style: { padding: '5px 0', borderBottom: '0' } },
+        h('img', { class: 'th', src: thumbUrl(d.path, 160), onclick: () => viewImage(fileUrl(d.path)) }),
+        h('div', { class: 'grow col', style: { gap: '1px' } },
+          h('div', { class: 'ell small' }, d.name || basename(d.path)),
+          h('div', { class: 'xs dim' }, `${fmtDims(d.width, d.height)} · ${fmtBytes(d.size)} · ${hostOf(d.pageUrl || d.url)}`)),
+        d.state === 'progress' ? h('span', { class: 'chip blue' }, 'downloading') : null,
+        bigger ? h('span', { class: 'chip green' }, 'larger') : null,
+        flagged ? h('span', { class: 'chip warn', title: 'Looks like a different picture' }, 'unrelated?') : null));
     }
-    if (it.status === 'done') sec.appendChild(h('div', { class: 'chip green', style: { marginTop: '8px' } }, icon('check'), 'Done'));
     return sec;
   }
 
-  renderResults(it, summary) {
+  // Sort the original or any of its downloaded versions. The file is done once all are dealt with.
+  renderSort(it) {
+    const sec = h('div', { class: 'section' });
+    const targets = [];
+    if (!it.originalSorted && !it.originalRecycled && !it.originalMissing) targets.push({ kind: 'item', id: it.id, label: 'Original', path: it.path, sub: fmtDims(it.width, it.height) });
+    for (const d of this.versions(it)) {
+      if (d.state !== 'completed') continue;
+      targets.push({ kind: 'download', id: d.id, label: d.name || basename(d.path), path: d.path, sub: fmtDims(d.width, d.height) });
+    }
+    sec.appendChild(h('h3', null, 'Sort into', h('span', { class: 'grow' }), h('span', { class: 'dim', style: { textTransform: 'none', letterSpacing: 0 } }, '1–9 · N · V')));
+    if (!targets.length) {
+      sec.appendChild(h('div', { class: 'dim xs' }, 'Nothing left to sort for this file.'));
+      return sec;
+    }
+    if (!this.target || !targets.find((t) => t.kind === this.target.kind && t.id === this.target.id)) this.target = targets[0];
+    if (targets.length > 1) {
+      if (it.phase === 'compare') sec.appendChild(h('div', { class: 'xs muted', style: { marginBottom: '6px' } }, 'Tip: Compare first to keep the best and recycle the rest — or sort any of them directly.'));
+      sec.appendChild(h('div', { class: 'sort-targets' }, targets.map((t) => h('label', { class: 'check' },
+        h('input', { type: 'radio', name: 'sorttarget', checked: t.kind === this.target.kind && t.id === this.target.id, onchange: () => { this.target = t; } }),
+        h('img', { src: thumbUrl(t.path, 120) }), h('span', { class: 'ell' }, t.label), h('span', { class: 'xs dim' }, t.sub)))));
+    }
+    this.sortPanel = createSortPanel({ target: () => this.target && { kind: this.target.kind, id: this.target.id }, compact: true, onSorted: () => emit('item-sorted', it.id) });
+    sec.appendChild(this.sortPanel);
+    return sec;
+  }
+
+  renderResults(it) {
     const sec = h('div', { class: 'section', style: { borderBottom: 0 } });
     const engines = ['iqdb', 'saucenao', 'ascii2d', 'tracemoe'].filter((e) => state.settings.engines[e] || (it.engines || {})[e]);
     sec.appendChild(h('h3', null, 'Matches', h('span', { class: 'grow' }),
@@ -196,14 +200,17 @@ export class ItemDetail {
       const rs = (it.results || []).filter((r) => r.engine === e);
       const st = (it.engines || {})[e];
       const err = (it.engineErrors || {})[e];
-      if (!rs.length && st !== 'error' && st !== 'blocked') continue;
-      const head = h('div', { class: 'engine-head' }, ENGINE_LABEL[e], h('span', { class: 'grow' }));
-      if (st === 'error' || st === 'blocked') {
-        head.appendChild(btn('Retry', { cls: 'sm', onclick: () => api.call('item:requeue', it.id, [e]) }));
-        if (e === 'ascii2d' && st === 'blocked') head.appendChild(btn('Open in browser', { cls: 'sm', onclick: () => emit('search-in-tab', { engine: 'ascii2d', path: it.path, itemId: it.id }) }));
+      if (!rs.length && st !== 'error' && st !== 'blocked' && st !== 'waiting') continue;
+      const collapsed = this.collapsed.has(e);
+      const head = h('div', { class: 'engine-head toggle-head', title: collapsed ? 'Show matches' : 'Hide matches', onclick: () => this.toggleEngine(e) },
+        icon(collapsed ? 'chevR' : 'chevD'), ENGINE_LABEL[e], h('span', { class: 'cnt' }, rs.length ? `${rs.length}` : ''), h('span', { class: 'grow' }));
+      if (st === 'error' || st === 'blocked' || st === 'waiting') {
+        head.appendChild(btn(st === 'waiting' ? 'Try now' : 'Retry', { cls: 'sm', onclick: (ev) => { ev.stopPropagation(); api.call('item:requeue', it.id, [e]); } }));
+        if (e === 'ascii2d' && st === 'blocked') head.appendChild(btn('Open ascii2d', { cls: 'sm', onclick: (ev) => { ev.stopPropagation(); emit('search-in-tab', { engine: 'ascii2d', path: it.path, itemId: it.id }); } }));
       }
       sec.appendChild(head);
-      if (err) sec.appendChild(h('div', { class: 'xs', style: { color: st === 'blocked' ? 'var(--warn)' : 'var(--danger)', margin: '0 0 4px 2px' } }, err));
+      if (collapsed) continue;
+      if (err) sec.appendChild(h('div', { class: 'xs', style: { color: st === 'error' ? 'var(--danger)' : 'var(--warn)', margin: '0 0 4px 22px' } }, err));
       const strong = rs.filter((r) => e === 'ascii2d' ? r.rank <= 3 && r.mode === 'color' : (r.similarity || 0) >= (min[e] || 0));
       const weak = rs.filter((r) => !strong.includes(r));
       for (const r of strong) sec.appendChild(this.resultRow(r));
@@ -218,8 +225,13 @@ export class ItemDetail {
       sec.appendChild(h('div', { class: 'dim xs' }, 'No matches found. Try Google Lens or Yandex above.'));
     }
     if (it.status === 'queued' || it.status === 'looking') sec.appendChild(h('div', { class: 'dim xs' }, it.status === 'looking' ? 'Looking up…' : 'Waiting in the queue…'));
-    void summary;
     return sec;
+  }
+
+  toggleEngine(e) {
+    this.collapsed.has(e) ? this.collapsed.delete(e) : this.collapsed.add(e);
+    lsSet('collapsed-engines', [...this.collapsed]);
+    this.render();
   }
 
   resultRow(r) {
@@ -241,7 +253,7 @@ export class ItemDetail {
         h('div', { class: 'row' }, h('span', { class: 'chip' }, r.site), bigger ? h('span', { class: 'chip green' }, 'larger') : null),
         h('div', { class: 'rt ell', title }, title),
         sub.length ? h('div', { class: 'xs dim ell' }, sub.join(' · ')) : null,
-        h('div', { class: 'links' }, links.slice(0, 5).map((u) => h('a', { title: u, onclick: () => this.open(u) }, shortUrl(u))))),
+        h('div', { class: 'links' }, links.slice(0, 5).map((u) => h('a', { title: u + '\n(opens in a new tab)', onclick: () => this.open(u) }, shortUrl(u))))),
       h('div', { class: 'sim ' + simClass(r.similarity) }, r.similarity != null ? r.similarity.toFixed(r.similarity >= 99.95 ? 0 : 1) + '%' : '#' + (r.rank + 1)));
   }
 
@@ -249,7 +261,7 @@ export class ItemDetail {
 
   async recycle() {
     const it = this.item;
-    if (!(await confirmBox('Recycle this file?', `${it.name} will be sent to the Recycle Bin.`, 'Recycle'))) return;
+    if (!(await confirmBox('Recycle the original?', `${it.name} will be sent to the Recycle Bin.`, 'Recycle'))) return;
     await api.call('item:recycle', it.id).then(() => toast('Sent to the Recycle Bin')).catch((e) => toast(e.message, 'error'));
   }
 }

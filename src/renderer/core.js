@@ -97,6 +97,14 @@ const P = {
   logo: '<circle cx="10.5" cy="10.5" r="6.5"/><path d="m20 20-4.8-4.8"/><rect x="7.5" y="8" width="6" height="5" rx="1"/>',
   menu: '<path d="M4 7h16M4 12h16M4 17h16"/>',
   store: '<path d="M4 9h16l-1 11H5z"/><path d="M8 9V7a4 4 0 0 1 8 0v2"/>',
+  expand: '<path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/>',
+  shrink: '<path d="M4 14h6v6M20 10h-6V4M14 10l7-7M3 21l7-7"/>',
+  panel: '<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M9 4v16"/>',
+  maximize: '<rect x="4" y="4" width="16" height="16" rx="2"/><path d="M4 9h16"/>',
+  dock: '<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M14 4v16"/><path d="m8 10 2 2-2 2"/>',
+  saveas: '<path d="M5 3h11l3 3v15H5z"/><path d="M8 3v5h7V3M8 21v-7h8v7"/>',
+  chevR: '<path d="m9 6 6 6-6 6"/>',
+  chevD: '<path d="m6 9 6 6 6-6"/>',
 };
 export function icon(name, cls) {
   const s = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
@@ -253,7 +261,7 @@ export function viewImage(src) {
 }
 
 // ---------- resizable side panels ----------
-export function makeResizable(side, key, min = 320, max = 900) {
+export function makeResizable(side, key, min = 320, max = 900, opts = {}) {
   const handle = h('div', { class: 'resizer' });
   side.appendChild(handle);
   const saved = +localStorageGet('w:' + key) || 0;
@@ -261,9 +269,10 @@ export function makeResizable(side, key, min = 320, max = 900) {
   handle.addEventListener('mousedown', (e) => {
     e.preventDefault();
     handle.classList.add('drag');
+    document.body.classList.add('resizing'); // stops web pages swallowing the drag
     const startX = e.clientX;
     const startW = side.getBoundingClientRect().width;
-    const left = side.classList.contains('left');
+    const left = opts.left != null ? opts.left : side.classList.contains('left');
     const move = (ev) => {
       const dx = ev.clientX - startX;
       const w = Math.max(min, Math.min(max, startW + (left ? dx : -dx)));
@@ -271,6 +280,7 @@ export function makeResizable(side, key, min = 320, max = 900) {
     };
     const up = () => {
       handle.classList.remove('drag');
+      document.body.classList.remove('resizing');
       document.removeEventListener('mousemove', move);
       document.removeEventListener('mouseup', up);
       localStorageSet('w:' + key, Math.round(side.getBoundingClientRect().width));
@@ -280,6 +290,8 @@ export function makeResizable(side, key, min = 320, max = 900) {
     document.addEventListener('mouseup', up);
   });
 }
+export function lsGet(k, d) { try { const v = localStorage.getItem(k); return v == null ? d : JSON.parse(v); } catch { return d; } }
+export function lsSet(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch { /* ignore */ } }
 function localStorageGet(k) { try { return localStorage.getItem(k); } catch { return null; } }
 function localStorageSet(k, v) { try { localStorage.setItem(k, v); } catch { /* ignore */ } }
 

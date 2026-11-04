@@ -71,10 +71,12 @@ ipcMain.on('helper:result', (_e, { id, ok, result, error }) => {
 });
 
 // Returns an upload-sized version of the image: original bytes when already small, else a resized JPEG.
-async function prepImage(filePath, s) {
+async function prepImage(filePath, s, opts = {}) {
   const info = await getImageInfo(filePath);
   const ext = path.extname(filePath).toLowerCase();
-  const simple = ['.jpg', '.jpeg', '.jfif', '.png'].includes(ext);
+  // Send the file as-is only when its real format matches its extension and it's within limits.
+  const realOk = (info.format === 'JPEG' && /\.(jpe?g|jfif)$/.test(ext)) || (info.format === 'PNG' && ext === '.png');
+  const simple = !opts.force && realOk;
   const maxSide = s.uploadMaxSide || 3000;
   const maxBytes = s.uploadMaxBytes || 4 * 1024 * 1024;
   if (simple && info.size <= maxBytes && Math.max(info.width, info.height) <= maxSide && info.width > 0) {
@@ -91,6 +93,15 @@ async function prepImage(filePath, s) {
 }
 
 function fileUrl(p) { return 'isf://f/' + encodeURIComponent(p); }
+
+// Mouse back/forward can arrive both as an app command and from the page itself; act once.
+let lastMouseNav = 0;
+function mouseNav(dir) {
+  if (Date.now() - lastMouseNav < 400) return;
+  lastMouseNav = Date.now();
+  emit('browser:shortcut', dir);
+}
+ipcMain.on('page:mousenav', (_e, dir) => mouseNav(dir === 'forward' ? 'forward' : 'back'));
 
 // ---------- protocols ----------
 function registerProtocols() {
@@ -172,6 +183,11 @@ function createWindow() {
   win.webContents.on('did-attach-webview', (_e, wc) => { if (browser) browser.attach(wc); });
   win.loadURL('app://ui/index.html');
   win.on('closed', () => { win = null; });
+  // Mouse back / forward buttons (Windows sends these as app commands).
+  win.on('app-command', (_e, cmd) => {
+    if (cmd === 'browser-backward') mouseNav('back');
+    if (cmd === 'browser-forward') mouseNav('forward');
+  });
   // Development hooks (used for automated checks): print renderer console, take screenshots.
   if (process.env.IMAGESEEK_DEBUG) {
     win.webContents.on('console-message', (e) => console.log(`[renderer:${e.level}] ${e.message}`));
@@ -258,33 +274,30 @@ function setupIpc() {
     return r.response;
   });
 
-  handle('batch:add', async (folder, mode, recursive) => {
-    const r = await lib.addBatch(folder, mode, recursive);
-    log(`Added ${r.added} file(s) from ${folder} for ${mode === 'upgrade' ? 'higher resolution' : 'identifying'}${r.skipped ? ` (${r.skipped} already in the list)` : ''}`);
+  handle('batch:add', async (folder, recursive) => {
+    const r = await lib.addBatch(folder, recursive);
+    log(`Added ${r.added} file(s) from ${folder}${r.skipped ? ` (${r.skipped} already in the list)` : ''}`);
     queue.kick();
     return { added: r.added, skipped: r.skipped, batchId: r.batch.id };
   });
   handle('batch:remove', async (id) => lib.removeBatch(id));
 
   handle('lib:snapshot', async () => lib.snapshot());
-  handle('lib:light', async () => {
-    const snap = { batches: lib.d.batches.map((b) => ({ ...b, counts: lib.batchCounts(b.id) })), downloads: Object.values(lib.d.downloads), sortLog: lib.d.sortLog.slice(-500) };
-    return snap;
-  });
+  handle('lib:light', async () => lib.light());
   handle('item:get', async (id) => lib.item(id));
   handle('item:summaries', async (ids) => ids.map((id) => lib.item(id)).filter(Boolean).map((it) => lib.summary(it)));
-  handle('item:mode', async (id, mode) => lib.setMode(id, mode));
   handle('item:requeue', async (id, engines) => { lib.requeue(id, engines); queue.kick(); });
   handle('item:recycle', async (id) => lib.recycleItem(id));
   handle('item:forget', async (id) => lib.forgetItem(id));
   handle('item:folder', async (id) => { const it = lib.item(id); return it ? lib.itemFolder(it) : null; });
-  handle('item:pending', async (id) => { const it = lib.item(id); return it ? lib.pendingKept(it) : []; });
+  handle('item:pending', async (id) => { const it = lib.item(id); return it ? lib.pending(it) : []; });
   handle('items:clearDone', async () => lib.clearDone());
-  handle('items:requeueErrors', async () => {
-    for (const it of Object.values(lib.d.items)) {
-      if (it.status === 'error') lib.requeue(it.id, Object.entries(it.engines || {}).filter(([, v]) => v === 'error' || v === 'blocked').map(([k]) => k));
-    }
+  handle('items:requeueErrors', async (engine) => {
+    const n = lib.requeueFailed(engine || null);
+    if (engine === 'iqdb' || !engine) queue.iqdbBusyUntil = 0;
     queue.kick();
+    queue.pushStatus();
+    return n;
   });
 
   handle('queue:status', async () => queue.status());
@@ -334,11 +347,17 @@ function setupIpc() {
   handle('browser:extensions', async () => browser.listExtensions());
   handle('browser:extRemove', async (id) => browser.uninstallExtension(id));
   handle('browser:extInstall', async (id) => browser.installById(id));
-  handle('browser:darkSite', async (host, enabled) => {
-    const list = new Set(settings.get().darkModeExclude);
-    enabled ? list.delete(host) : list.add(host);
-    return settings.set({ darkModeExclude: [...list] });
+  handle('browser:siteTheme', async (url, theme) => browser.setSiteTheme(url, theme));
+  handle('browser:themeFor', async (url) => browser.themeFor(url));
+  handle('browser:clearSiteTheme', async (host) => {
+    const map = { ...(settings.get().siteThemes || {}) };
+    delete map[host];
+    return settings.set({ siteThemes: map });
   });
+  handle('browser:saveCurrent', async (wcId, mode) => browser.saveCurrent(wcId, mode));
+  handle('sort:clearLog', async () => { lib.clearLog(); log('Cleared the sort log'); });
+  handle('log:clear', async () => { logLines.length = 0; });
+  handle('lib:checkMissing', async () => lib.checkMissing());
 
   ipcMain.on('drag:start', (e, filePath) => {
     let icon = null;
@@ -409,7 +428,7 @@ app.whenReady().then(async () => {
   browser = new BrowserManager({ paths, settings, lib, passwords, emit, log, getWindow: () => win, prepImage });
   queue = new LookupQueue({
     library: lib, settings, fetch: fetchFn,
-    browserFetch: (url, opts) => session.fromPartition(PARTITION).fetch(url, opts),
+    render: (o) => browser.renderPage(o),
     prepImage, log, emit,
   });
   setupIpc();
@@ -431,5 +450,19 @@ app.whenReady().then(async () => {
     }).catch(() => {});
   }
   win.webContents.once('did-finish-load', () => setTimeout(() => queue.kick(), 1500));
+  // Files moved or deleted outside the app drop out of it (checked every 20 s and on focus).
+  let lastCheck = 0;
+  const check = async () => {
+    if (Date.now() - lastCheck < 4000) return;
+    lastCheck = Date.now();
+    try {
+      const n = await lib.checkMissing();
+      if (n) queue.pushStatus();
+    } catch (e) { log('File check failed: ' + e.message, 'warn'); }
+  };
+  setInterval(check, 20000);
+  win.on('focus', check);
+  setTimeout(check, 3000);
+
   log(`Image Seek ${app.getVersion()} started — data in ${paths.data}`);
 });

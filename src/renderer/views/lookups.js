@@ -1,5 +1,5 @@
 // Lookups: add folders, watch the queue, browse files and open their details.
-import { api, state, h, icon, btn, seg, clear, thumbUrl, fmtDims, toast, on, emit, modal, safe, confirmBox, makeResizable } from '../core.js';
+import { api, state, h, icon, btn, seg, clear, thumbUrl, fmtDims, toast, on, emit, modal, safe, confirmBox, makeResizable, popupMenu, ENGINE_LABEL } from '../core.js';
 import { ItemDetail } from './itemdetail.js';
 
 const TILE_W = 172, TILE_H = 228, GAP = 8;
@@ -8,7 +8,8 @@ export class LookupsView {
   constructor(root) {
     this.root = root;
     this.filter = 'active';
-    this.mode = 'all';
+    this.extra = 'all'; // all | bigger | downloads
+    this.dock = 'closed';
     this.batch = 'all';
     this.q = '';
     this.list = [];
@@ -21,21 +22,25 @@ export class LookupsView {
   build() {
     this.imgCache = new Map();
     this.statusSeg = seg(this.statusOptions(), this.filter, (v) => { this.filter = v; this.apply(); });
-    this.modeSeg = seg([
-      { value: 'all', label: 'Both' }, { value: 'identify', label: 'Identify' }, { value: 'upgrade', label: 'Higher res' },
-    ], this.mode, (v) => { this.mode = v; this.apply(); });
+    this.extraSeg = seg([
+      { value: 'all', label: 'Any' },
+      { value: 'bigger', label: 'Larger found', title: 'Files where a lookup found a bigger version' },
+      { value: 'downloads', label: 'Has downloads', title: 'Files with downloaded versions waiting' },
+    ], this.extra, (v) => { this.extra = v; this.apply(); });
     this.batchSel = h('select', { class: 'input', style: { maxWidth: '220px' }, onchange: () => { this.batch = this.batchSel.value; this.apply(); } });
-    this.search = h('input', { class: 'input search', placeholder: 'Search name, series, character, artist', style: { width: '260px' }, oninput: () => { this.q = this.search.value.trim().toLowerCase(); this.apply(); } });
+    this.search = h('input', { class: 'input search', placeholder: 'Search name, series, character, artist', style: { flex: '1 1 140px', minWidth: '120px', maxWidth: '300px' }, oninput: () => { this.q = this.search.value.trim().toLowerCase(); this.apply(); } });
     this.queueBtn = btn('Pause', { icon: 'pause', onclick: () => this.toggleQueue() });
+    this.retryBtn = btn('Retry', { icon: 'reload', title: 'Retry failed or blocked lookups', onclick: (e) => this.retryMenu(e) });
+    this.browserBtn = btn('Browser', { icon: 'globe', title: 'Show or hide the browser next to the files', onclick: () => emit('dock', this.dock === 'closed' ? (state.lastDock || 'small') : 'closed') });
     this.toolbar = h('div', { class: 'toolbar' },
       btn('Add folder', { icon: 'plus', cls: 'primary', onclick: () => this.addFolder() }),
       this.batchSel,
       h('div', { class: 'vsep' }),
-      this.statusSeg, this.modeSeg,
+      this.statusSeg, this.extraSeg,
       this.search,
-      h('div', { class: 'grow' }),
+      this.browserBtn,
       this.queueBtn,
-      btn('', { icon: 'reload', title: 'Retry failed lookups', onclick: () => safe(() => api.call('items:requeueErrors'), 'Retrying failed lookups') }),
+      this.retryBtn,
       btn('', { icon: 'trash', title: 'Clear finished files from the list', onclick: () => this.clearDone() }));
 
     this.grid = h('div', { class: 'grid', tabindex: '0' });
@@ -43,13 +48,17 @@ export class LookupsView {
     this.grid.appendChild(this.inner);
     this.emptyEl = h('div', { class: 'empty hidden', style: { position: 'absolute', inset: '0' } });
     this.grid.appendChild(this.emptyEl);
+    this.gridPane = h('div', { class: 'gridpane' }, this.grid);
+    makeResizable(this.gridPane, 'lookups-grid', 200, 1400, { left: true });
+    this.slot = h('div', { class: 'bslot' });
+    this.mainEl = h('div', { class: 'main lk-main dock-closed' }, this.gridPane, this.slot);
     this.side = h('div', { class: 'side' });
     makeResizable(this.side, 'lookups', 380, 900);
     this.detailHost = h('div', { style: { display: 'flex', flexDirection: 'column', flex: '1', minHeight: '0' } });
     this.side.appendChild(this.detailHost);
     this.detail = new ItemDetail(this.detailHost);
     this.detail.render();
-    this.root.append(this.toolbar, h('div', { class: 'split' }, h('div', { class: 'main' }, this.grid), this.side));
+    this.root.append(this.toolbar, h('div', { class: 'split' }, this.mainEl, this.side));
 
     this.grid.addEventListener('scroll', () => this.renderVisible());
     new ResizeObserver(() => this.layout()).observe(this.grid);
@@ -78,7 +87,7 @@ export class LookupsView {
     clear(this.batchSel);
     this.batchSel.appendChild(h('option', { value: 'all' }, `All folders (${state.batches.length})`));
     for (const b of state.batches) {
-      this.batchSel.appendChild(h('option', { value: b.id }, `${b.name} — ${b.mode === 'upgrade' ? 'higher res' : 'identify'} (${b.counts.total - b.counts.done}/${b.counts.total})`));
+      this.batchSel.appendChild(h('option', { value: b.id }, `${b.name} (${b.counts.total - b.counts.done}/${b.counts.total})`));
     }
     this.batchSel.value = state.batches.some((b) => b.id === cur) ? cur : 'all';
     this.batch = this.batchSel.value;
@@ -86,7 +95,8 @@ export class LookupsView {
 
   matches(s) {
     if (this.batch !== 'all' && s.batchId !== this.batch) return false;
-    if (this.mode !== 'all' && s.mode !== this.mode) return false;
+    if (this.extra === 'bigger' && !s.bigger) return false;
+    if (this.extra === 'downloads' && !s.pendingDownloads) return false;
     if (this.q) {
       const g = s.guess || {};
       const hay = [s.name, ...(g.series || []).map((x) => x.name), ...(g.characters || []).map((x) => x.name), ...(g.artists || []).map((x) => x.name)].join(' ').toLowerCase();
@@ -96,10 +106,10 @@ export class LookupsView {
   }
 
   statusOk(s, f) {
-    const done = s.status === 'done' || s.status === 'sorted';
+    const done = s.status === 'done';
     if (f === 'all') return true;
     if (f === 'active') return !done;
-    if (f === 'queued') return s.status === 'queued' || s.status === 'looking' || (s.engines && s.engines.saucenao === 'waiting');
+    if (f === 'queued') return !done && (s.status === 'queued' || s.status === 'looking' || Object.values(s.engines || {}).includes('waiting'));
     if (f === 'looked') return s.status === 'looked';
     if (f === 'error') return s.status === 'error';
     if (f === 'done') return done;
@@ -160,14 +170,15 @@ export class LookupsView {
   tile(s, i) {
     const row = Math.floor(i / this.cols), col = i % this.cols;
     const g = s.guess || {};
+    const waiting = Object.entries(s.engines || {}).filter(([, v]) => v === 'waiting').map(([k]) => ENGINE_LABEL[k]);
     const sub = s.status === 'queued' ? 'Queued' : s.status === 'looking' ? 'Looking up…' : s.status === 'error' ? (s.error || 'Error')
-      : s.status === 'sorted' ? 'Sorted → ' + (s.sortedTo || '') : s.status === 'done' ? 'Done'
+      : s.status === 'done' ? 'Done' + (s.sortedTo ? ' → ' + s.sortedTo : '')
         : (g.series && g.series[0] ? g.series[0].name : (g.artists && g.artists[0] ? g.artists[0].name : 'No match'));
     const tags = h('div', { class: 'tags' },
-      h('span', { class: 'chip ' + (s.mode === 'upgrade' ? 'blue' : '') }, s.mode === 'upgrade' ? 'Higher res' : 'Identify'),
-      s.bigger ? h('span', { class: 'chip green' }, '↑ ' + fmtDims(s.bigger.width, s.bigger.height)) : null,
-      s.downloads ? h('span', { class: 'chip warn' }, `${s.downloads} downloaded`) : null,
-      s.engines && s.engines.saucenao === 'waiting' ? h('span', { class: 'chip' }, 'SauceNAO later') : null);
+      s.bigger ? h('span', { class: 'chip green', title: 'A larger version was found on ' + s.bigger.site }, '↑ ' + fmtDims(s.bigger.width, s.bigger.height)) : null,
+      s.pendingDownloads ? h('span', { class: 'chip warn' }, `${s.pendingDownloads} downloaded`) : null,
+      s.originalSorted && s.status !== 'done' ? h('span', { class: 'chip blue' }, 'original sorted') : null,
+      waiting.length ? h('span', { class: 'chip', title: 'Will be retried automatically' }, waiting.join(', ') + ' later') : null);
     const el = h('div', {
       class: 'tile' + (s.id === this.detail.id ? ' sel' : ''),
       style: { left: col * (this.tileW + GAP) + 'px', top: row * (TILE_H + GAP) + 'px', width: this.tileW + 'px', height: TILE_H + 'px' },
@@ -239,6 +250,27 @@ export class LookupsView {
     }, 450);
   }
 
+  retryMenu(e) {
+    const f = (state.queue && state.queue.failed) || {};
+    const r = e.currentTarget.getBoundingClientRect();
+    const items = [{ label: `All failed and blocked (${f.all || 0})`, run: () => this.retry(null) }, '-'];
+    for (const k of ['iqdb', 'saucenao', 'ascii2d', 'tracemoe']) items.push({ label: `${ENGINE_LABEL[k]} only (${f[k] || 0})`, run: () => this.retry(k) });
+    popupMenu(r.left, r.bottom + 4, items);
+  }
+
+  async retry(engine) {
+    const n = await safe(() => api.call('items:requeueErrors', engine));
+    if (n != null) toast(n ? `Retrying ${n} file${n === 1 ? '' : 's'}${engine ? ' on ' + ENGINE_LABEL[engine] : ''}` : 'Nothing to retry', n ? 'info' : 'warn');
+  }
+
+  setDock(d) {
+    this.dock = d;
+    this.mainEl.classList.remove('dock-closed', 'dock-small', 'dock-expanded');
+    this.mainEl.classList.add('dock-' + d);
+    this.browserBtn.classList.toggle('on', d !== 'closed');
+    requestAnimationFrame(() => this.layout());
+  }
+
   renderQueueBtn() {
     const q = state.queue || {};
     clear(this.queueBtn);
@@ -260,32 +292,22 @@ export class LookupsView {
 
   async addFolder(prefill) {
     let folder = prefill || null;
-    let mode = 'identify';
     let recursive = !!state.settings.includeSubfolders;
     const pathEl = h('div', { class: 'input ell', style: { display: 'flex', alignItems: 'center', flex: 1 } }, folder || 'No folder chosen');
     const choose = async () => {
       const f = await api.call('dialog:folder', 'Choose a folder of images');
       if (f) { folder = f; pathEl.textContent = f; }
     };
-    const opt = (value, title, text, ic) => {
-      const l = h('label', { class: value === mode ? 'on' : '' }, h('input', { type: 'radio', name: 'mode', value }), h('b', null, icon(ic), title), h('span', null, text));
-      l.onclick = () => { mode = value; cards.querySelectorAll('label').forEach((x) => x.classList.toggle('on', x === l)); };
-      return l;
-    };
-    const cards = h('div', { class: 'option-cards' },
-      opt('identify', 'Identify', 'Find the series, character and artist, then sort the files into your folders.', 'search'),
-      opt('upgrade', 'Higher resolution', 'Find better versions, download them in the app\'s browser, compare, keep the best.', 'sparkle'));
     const sub = h('input', { type: 'checkbox', checked: recursive, onchange: (e) => { recursive = e.target.checked; } });
     if (!folder) setTimeout(choose, 50);
     const r = await modal('Add a folder', [
       h('div', { class: 'row' }, pathEl, btn('Browse…', { icon: 'folder', onclick: choose })),
-      cards,
       h('label', { class: 'check' }, sub, 'Include subfolders'),
-      h('div', { class: 'xs dim' }, 'Files stay where they are until you sort or recycle them.'),
+      h('div', { class: 'xs dim' }, 'Each file is looked up for its series, characters, artist and any larger versions. Sort it straight away, or download better versions and compare. Files stay where they are until you sort or recycle them.'),
     ], [{ label: 'Cancel', value: () => null }, { label: 'Add and look up', primary: true, value: () => 'ok' }]);
     if (r !== 'ok' || !folder) return;
     if (recursive !== state.settings.includeSubfolders) state.settings = await api.call('settings:set', { includeSubfolders: recursive });
-    const res = await safe(() => api.call('batch:add', folder, mode, recursive));
+    const res = await safe(() => api.call('batch:add', folder, recursive));
     if (res) {
       toast(res.added ? `Added ${res.added} image(s)${res.skipped ? `, ${res.skipped} already listed` : ''}` : 'No new images found in that folder', res.added ? 'info' : 'warn');
       this.filter = 'active';

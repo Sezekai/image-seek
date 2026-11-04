@@ -1,5 +1,5 @@
 // Settings: folders, lookups, browser, Firefox import, resets.
-import { api, state, h, icon, btn, seg, clear, toast, on, emit, confirmBox, modal, fmtTime } from '../core.js';
+import { api, state, h, icon, btn, seg, clear, toast, on, emit, confirmBox, modal, fmtTime, ENGINE_LABEL } from '../core.js';
 
 export class SettingsView {
   constructor(root) {
@@ -65,7 +65,9 @@ export class SettingsView {
       'Matches below this are hidden under "weaker matches" and not used for the best guess.'),
       this.field('Flag unrelated downloads', h('div', { class: 'row small muted' }, h('input', { class: 'input', type: 'number', min: '4', max: '40', value: s.unrelatedThreshold, style: { width: '70px' }, onchange: (e) => this.set({ unrelatedThreshold: +e.target.value || 20 }) }), 'difference (0 = identical, 64 = completely different)'),
       'A download linked to a file is flagged when it looks this different from it.'),
-      this.field('Retry', h('div', { class: 'row' }, btn('Retry all failed lookups', { icon: 'reload', onclick: () => api.call('items:requeueErrors').then(() => toast('Retrying')) }))),
+      this.field('Retry failed / blocked', h('div', { class: 'row wrap' },
+        btn('All', { icon: 'reload', onclick: () => api.call('items:requeueErrors').then((n) => toast(n ? `Retrying ${n} file(s)` : 'Nothing to retry')) }),
+        ...['iqdb', 'saucenao', 'ascii2d', 'tracemoe'].map((k) => btn(ENGINE_LABEL[k], { onclick: () => api.call('items:requeueErrors', k).then((n) => toast(n ? `Retrying ${n} file(s) on ${ENGINE_LABEL[k]}` : 'Nothing to retry')) })))),
     ));
 
     // ---------- browser
@@ -77,12 +79,14 @@ export class SettingsView {
       btn('Remove', { cls: 'sm danger', onclick: async () => { if (await confirmBox('Remove extension?', e.name, 'Remove')) api.call('browser:extRemove', e.id).catch((x) => toast(x.message, 'error')); } })))
       : h('div', { class: 'dim small' }, 'No extensions installed'));
     const extId = h('input', { class: 'input grow', placeholder: 'Chrome Web Store link or extension ID' });
-    const excl = s.darkModeExclude || [];
+    const themes = Object.entries(s.siteThemes || {}).sort((a, b) => a[0].localeCompare(b[0]));
     this.wrap.appendChild(h('div', { class: 'card' }, h('h2', null, icon('globe'), 'Browser'),
       this.field('Home page', h('input', { class: 'input', value: s.homepage, onchange: (e) => this.set({ homepage: e.target.value.trim() || 'https://www.google.com/' }) })),
       this.field('Ad blocking', adSeg, 'Built-in uses the uBlock Origin / EasyList filter lists (plus cookie-banner lists) without Chrome\'s extension limits.'),
-      this.field('Dark mode', h('label', { class: 'toggle' }, h('input', { type: 'checkbox', checked: s.darkMode, onchange: (e) => this.set({ darkMode: e.target.checked }) }), 'Make websites dark (Dark Reader)'),
-        excl.length ? h('div', { class: 'row wrap', style: { gap: '4px' } }, h('span', { class: 'hint' }, 'Off for:'), excl.map((x) => h('button', { class: 'chip', title: 'Turn dark mode back on for this site', onclick: () => api.call('browser:darkSite', x, true).then((st) => { state.settings = st; this.render(); }) }, x, ' ×'))) : 'Use the moon button in the browser to turn it off for one site.'),
+      this.field('Dark mode', h('label', { class: 'toggle' }, h('input', { type: 'checkbox', checked: s.darkMode, onchange: (e) => this.set({ darkMode: e.target.checked }) }), 'Show websites dark by default (Dark Reader)'),
+        themes.length ? h('div', { class: 'row wrap', style: { gap: '4px' } }, h('span', { class: 'hint' }, 'Per-site choices:'),
+          themes.map(([host, t]) => h('button', { class: 'chip ' + (t === 'dark' ? '' : 'warn'), title: 'Remove — the site goes back to the default', onclick: () => api.call('browser:clearSiteTheme', host).then((st) => { state.settings = st; emit('settings', st); this.render(); }) }, `${host} · ${t}`, ' ×')))
+          : 'Use the moon / sun button in the browser to switch one site; it\'s remembered for that site.'),
       this.field('Autofill logins', h('label', { class: 'toggle' }, h('input', { type: 'checkbox', checked: s.autofill, onchange: (e) => this.set({ autofill: e.target.checked }) }), 'Fill saved logins on sign-in pages')),
       this.field('Extensions', h('div', { class: 'col' }, extList, h('div', { class: 'row' }, extId,
         btn('Install', { icon: 'plus', onclick: () => {

@@ -52,16 +52,15 @@ export class CompareView {
   }
 
   candidates() {
-    return [...state.items.values()].filter((s) => s.mode === 'upgrade' && (s.downloads > 0 || s.phase === 'sort' || s.phase === 'compare'));
+    return [...state.items.values()].filter((s) => s.status !== 'done' && (s.pendingDownloads > 0 || s.phase === 'sort'));
   }
 
   renderList() {
     clear(this.listEl);
     const all = this.candidates();
     const groups = [
-      ['To compare', all.filter((s) => s.phase !== 'sort' && s.status !== 'done')],
-      ['To sort', all.filter((s) => s.phase === 'sort' && s.status !== 'done')],
-      ['Done', all.filter((s) => s.status === 'done')],
+      ['To compare', all.filter((s) => s.phase !== 'sort')],
+      ['To sort', all.filter((s) => s.phase === 'sort')],
     ];
     for (const [label, list] of groups) {
       if (!list.length) continue;
@@ -70,7 +69,7 @@ export class CompareView {
         this.listEl.appendChild(h('div', { class: 'ci' + (s.id === this.itemId ? ' on' : ''), onclick: () => this.load(s.id) },
           h('img', { src: thumbUrl(s.path, 120) }),
           h('div', { class: 'grow col', style: { gap: '1px' } }, h('div', { class: 'ell small' }, s.name),
-            h('div', { class: 'xs dim' }, s.status === 'done' ? 'Done' : `${s.downloads} download${s.downloads === 1 ? '' : 's'} · ${fmtDims(s.width, s.height)}`))));
+            h('div', { class: 'xs dim' }, `${s.pendingDownloads} download${s.pendingDownloads === 1 ? '' : 's'} · ${fmtDims(s.width, s.height)}`))));
       }
     }
     if (!all.length) this.listEl.appendChild(h('div', { class: 'empty' }, icon('compare'), h('div', { class: 'small' }, 'Files you download higher-resolution versions for appear here.')));
@@ -101,8 +100,9 @@ export class CompareView {
     const it = this.item;
     const out = [];
     if (!it) return out;
-    if (!it.originalRecycled && !(it.phase === 'sort' && it.originalSorted)) {
-      out.push({ key: 'original', label: 'Original', path: it.path, w: it.width, h: it.height, size: it.size, format: it.format, quality: it.quality });
+    if (!it.originalRecycled && !it.originalMissing) {
+      // A sorted original is still shown for comparison, but it's already kept.
+      out.push({ key: 'original', label: it.originalSorted ? 'Original (sorted)' : 'Original', locked: !!it.originalSorted, path: it.path, w: it.width, h: it.height, size: it.size, format: it.format, quality: it.quality });
     }
     let n = 1;
     for (const id of it.downloads || []) {
@@ -168,7 +168,8 @@ export class CompareView {
       const isBestRes = px && px === maxPx;
       const isBestSize = d.size && d.size === maxSize;
       const isBestQ = maxQ > 0 && qualities[i] === maxQ && data.length > 1;
-      const keepCb = h('input', { type: 'checkbox', checked: this.keep.has(d.key), onchange: (e) => { e.target.checked ? this.keep.add(d.key) : this.keep.delete(d.key); pane.classList.toggle('keep', e.target.checked); this.updateKeepBtn(); } });
+      if (d.locked) this.keep.add(d.key);
+      const keepCb = h('input', { type: 'checkbox', disabled: !!d.locked, title: d.locked ? 'Already sorted' : '', checked: this.keep.has(d.key), onchange: (e) => { e.target.checked ? this.keep.add(d.key) : this.keep.delete(d.key); pane.classList.toggle('keep', e.target.checked); this.updateKeepBtn(); } });
       const stats = h('div', { class: 'stats' },
         h('span', { class: 'chip' + (isBestRes ? ' green' : ''), title: isBestRes ? 'Highest resolution' : '' }, `${fmtDims(d.w, d.h)} · ${fmtMp(d.w, d.h)}`),
         h('span', { class: 'chip' + (isBestSize ? ' green' : ''), title: isBestSize ? 'Biggest file' : '' }, fmtBytes(d.size)),
@@ -300,17 +301,21 @@ export class CompareView {
 
   async apply() {
     const data = this.panesData();
-    const keep = data.filter((d) => this.keep.has(d.key));
-    const drop = data.filter((d) => !this.keep.has(d.key));
-    if (!keep.length) { toast('Select at least one version to keep', 'warn'); return; }
+    const keep = data.filter((d) => this.keep.has(d.key) && !d.locked);
+    const drop = data.filter((d) => !this.keep.has(d.key) && !d.locked);
+    if (!keep.length && data.some((d) => d.locked)) {
+      // Original already sorted: keeping none of the downloads is fine.
+      if (!drop.length) { toast('Nothing to change', 'warn'); return; }
+    }
+    if (!keep.length && !data.some((d) => d.locked)) { toast('Select at least one version to keep', 'warn'); return; }
     const r = await modal('Keep selected versions?', [
-      h('div', null, h('b', null, 'Keep: '), keep.map((d) => d.label).join(', ')),
+      h('div', null, h('b', null, 'Keep: '), keep.length ? keep.map((d) => d.label).join(', ') : 'none (the original is already sorted)'),
       drop.length ? h('div', null, h('b', null, 'Recycle Bin: '), drop.map((d) => d.label).join(', ')) : h('div', { class: 'muted' }, 'Nothing will be recycled.'),
       h('div', { class: 'xs dim' }, 'Next you\'ll choose folders for the kept files. Once they\'re all sorted, the file\'s download folder is removed and it\'s marked done.'),
     ], [{ label: 'Cancel', value: () => null }, { label: 'Keep and continue', primary: true, value: () => 'ok' }]);
     if (r !== 'ok') return;
     try {
-      const res = await api.call('keep:apply', this.item.id, keep.map((d) => d.key));
+      const res = await api.call('keep:apply', this.item.id, [...keep.map((d) => d.key), ...data.filter((d) => d.locked).map((d) => d.key)]);
       toast(`Kept ${keep.length}${res.recycled ? `, ${res.recycled} sent to the Recycle Bin` : ''}`);
     } catch (e) { toast(e.message, 'error'); }
   }
@@ -324,12 +329,12 @@ export class CompareView {
       return;
     }
     const pending = [];
-    if ((it.keep || []).includes('original') && !it.originalSorted && !it.originalRecycled) pending.push({ kind: 'item', id: it.id, label: 'Original', path: it.path });
-    for (const k of it.keep || []) {
-      if (k === 'original') continue;
-      const d = state.downloads.get(k);
-      if (d && !d.sortedTo) pending.push({ kind: 'download', id: d.id, label: d.name || basename(d.path), path: d.path });
+    if (!it.originalSorted && !it.originalRecycled && !it.originalMissing) pending.push({ kind: 'item', id: it.id, label: 'Original', path: it.path });
+    for (const id of it.downloads || []) {
+      const d = state.downloads.get(id);
+      if (d && !d.sortedTo && d.state === 'completed') pending.push({ kind: 'download', id: d.id, label: d.name || basename(d.path), path: d.path });
     }
+    if (!pending.length) { this.sortHost.appendChild(h('div', { class: 'muted small' }, 'Nothing left to sort.')); return; }
     if (!this.sel || !pending.find((p) => p.id === this.sel.id && p.kind === this.sel.kind)) this.sel = pending[0];
     const pick = h('div', { class: 'row wrap' }, h('span', { class: 'muted small' }, 'Sort kept files:'), pending.map((p) => h('label', { class: 'check' },
       h('input', { type: 'radio', name: 'cmpsort', checked: this.sel && this.sel.id === p.id && this.sel.kind === p.kind, onchange: () => { this.sel = p; } }),

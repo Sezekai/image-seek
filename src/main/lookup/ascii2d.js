@@ -1,6 +1,5 @@
 'use strict';
-// ascii2d.net — good for Pixiv and X/Twitter originals. Runs in the browser session so any
-// Cloudflare clearance you got while browsing ascii2d is reused.
+// ascii2d.net — good for Pixiv and X/Twitter originals.
 const { multipart, decodeEntities, absUrl } = require('./multipart');
 
 const BASE = 'https://ascii2d.net';
@@ -49,34 +48,42 @@ function hostLabel(u) {
   try { return new URL(u).hostname.replace(/^www\./, ''); } catch { return 'ascii2d'; }
 }
 
-async function search(fetchImpl, image) {
+// Runs the search in a hidden page of the app's browser session (the same way the manual
+// button does), so Cloudflare's browser check passes and its clearance cookie is reused.
+async function search(render, image) {
   const form = multipart([
     { name: 'utf8', value: '✓' },
     { name: 'file', filename: image.filename, contentType: image.mime, data: image.buffer },
   ]);
-  const res = await fetchImpl(BASE + '/search/file', {
-    method: 'POST',
-    headers: { 'Content-Type': form.contentType, Referer: BASE + '/' },
-    body: form.body,
+  const first = await render({
+    url: BASE + '/search/file',
+    postData: form.body,
+    contentType: form.contentType,
+    referer: BASE + '/',
+    done: (u, html) => /\/search\/(color|bovw)\//.test(u) && /item-box|class=['"]row/i.test(html),
+    timeout: 45000,
   });
-  const html = await res.text();
-  if (res.status === 403 || res.status === 503 || /cf-chl|challenge-platform|Just a moment/i.test(html)) {
-    throw new BlockedError('ascii2d showed a Cloudflare check. Open ascii2d in the browser once, then retry.');
+  if (first.blocked || !/\/search\/color\//.test(first.url)) {
+    if (first.blocked || /cf-chl|challenge-platform|Just a moment|turnstile/i.test(first.html)) {
+      throw new BlockedError('ascii2d wants a Cloudflare check. Open ascii2d with the button below, pass the check once, then retry.');
+    }
+    throw new Error('ascii2d returned an unexpected page');
   }
-  if (!res.ok) throw new Error('ascii2d error ' + res.status);
-  const colorUrl = res.url;
-  const results = parse(html, 'color').slice(0, 10);
+  const results = parse(first.html, 'color').slice(0, 10);
   // Feature (bovw) search finds crops and edits that colour search misses.
-  let bovw = [];
-  if (/\/search\/color\//.test(colorUrl)) {
-    try {
-      const r2 = await fetchImpl(colorUrl.replace('/color/', '/bovw/'), { headers: { Referer: colorUrl } });
-      if (r2.ok) bovw = parse(await r2.text(), 'bovw').slice(0, 6);
-    } catch (_) { /* optional */ }
-  }
-  const seen = new Set(results.map((r) => r.url));
-  for (const b of bovw) if (!seen.has(b.url)) results.push(b);
-  return { results, pageUrl: colorUrl };
+  try {
+    const second = await render({
+      url: first.url.replace('/color/', '/bovw/'),
+      referer: first.url,
+      done: (u, html) => /\/search\/bovw\//.test(u) && /item-box/i.test(html),
+      timeout: 25000,
+    });
+    if (!second.blocked) {
+      const seen = new Set(results.map((r) => r.url));
+      for (const b of parse(second.html, 'bovw').slice(0, 6)) if (!seen.has(b.url)) results.push(b);
+    }
+  } catch (_) { /* optional */ }
+  return { results, pageUrl: first.url };
 }
 
 module.exports = { search, parse, BlockedError };

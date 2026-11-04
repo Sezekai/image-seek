@@ -1,6 +1,6 @@
 import { api, state, h, icon, clear, on, emit, toast, viewImage, fileUrl, fmtTime, prepForUpload, dHash } from './core.js';
 import { LookupsView } from './views/lookups.js';
-import { BrowserView } from './views/browser.js';
+import { Browser, BrowserView } from './views/browser.js';
 import { DownloadsView } from './views/downloads.js';
 import { CompareView } from './views/compare.js';
 import { SortLogView, HistoryView } from './views/misc.js';
@@ -11,12 +11,13 @@ const VIEWS = [
   { id: 'browser', label: 'Browser', icon: 'globe', cls: BrowserView },
   { id: 'downloads', label: 'Downloads', icon: 'download', cls: DownloadsView },
   { id: 'compare', label: 'Compare', icon: 'compare', cls: CompareView },
-  { id: 'sortlog', label: 'Sort log', icon: 'log', cls: SortLogView },
+  { id: 'sortlog', label: 'Log', icon: 'log', cls: SortLogView },
   { id: 'history', label: 'History', icon: 'history', cls: HistoryView },
   { id: 'settings', label: 'Settings', icon: 'settings', cls: SettingsView, bottom: true },
 ];
 
 const views = {};
+let browser = null;
 const railBtns = {};
 
 // ---------- renderer helper for the main process ----------
@@ -72,7 +73,7 @@ async function sync() {
 function updateBadges() {
   const dl = [...state.downloads.values()].filter((d) => d.state === 'progress').length;
   setBadge('downloads', dl);
-  const cmp = [...state.items.values()].filter((s) => s.mode === 'upgrade' && s.downloads > 0 && s.phase !== 'sort' && s.status !== 'done').length;
+  const cmp = [...state.items.values()].filter((s) => s.pendingDownloads > 0 && s.phase !== 'sort' && s.status !== 'done').length;
   setBadge('compare', cmp);
 }
 function setBadge(view, n) {
@@ -91,6 +92,36 @@ function showView(id) {
   }
   const inst = views[id].inst;
   if (inst && inst.onShow) inst.onShow();
+  placeBrowser();
+}
+
+// Show the shared browser in the Browser tab, docked in Lookups, or not at all.
+function placeBrowser() {
+  if (!browser) return;
+  const lk = views.lookups.inst;
+  if (state.view === 'browser') browser.show(views.browser.inst.slot, 'full');
+  else if (state.view === 'lookups' && lk.dock !== 'closed') browser.show(lk.slot, lk.dock);
+  else browser.hide();
+}
+
+function setDock(d) {
+  const lk = views.lookups.inst;
+  if (d !== 'closed') state.lastDock = d;
+  lk.setDock(d);
+  api.call('settings:set', { dock: d });
+  requestAnimationFrame(placeBrowser);
+}
+
+// Links opened from Lookups open in a new tab in the docked browser; from anywhere else, in the Browser tab.
+function openUrl({ url, itemId }) {
+  if (state.view === 'lookups') { if (views.lookups.inst.dock === 'closed') setDock(state.lastDock || 'small'); }
+  else if (state.view !== 'browser') showView('browser');
+  browser.open(url, { itemId, active: true });
+}
+function searchInTab(o) {
+  if (state.view === 'lookups') { if (views.lookups.inst.dock === 'closed') setDock(state.lastDock || 'small'); }
+  else if (state.view !== 'browser') showView('browser');
+  browser.searchIn(o);
 }
 
 function renderStatus() {
@@ -102,6 +133,8 @@ function renderStatus() {
   else if (q.current) parts.push(h('span', { class: 'pill' }, h('span', { class: 'dot looking' }), ` ${q.current.engine ? q.current.engine + ': ' : ''}${q.current.name}`));
   if (q.queued) parts.push(h('span', { class: 'chip' }, `${q.queued} queued`));
   if (q.waitingSauce) parts.push(h('span', { class: 'chip warn', title: 'Waiting for SauceNAO quota — they\'ll continue automatically' }, `${q.waitingSauce} waiting for SauceNAO`));
+  if (q.waitingIqdb) parts.push(h('span', { class: 'chip warn', title: 'IQDB was busy — these are retried automatically' }, `${q.waitingIqdb} waiting for IQDB`));
+  if (q.failed && q.failed.all) parts.push(h('span', { class: 'chip red', title: 'Failed or blocked lookups — use Retry in Lookups' }, `${q.failed.all} failed`));
   const sq = q.sauceQuota || {};
   if (sq.long != null) parts.push(h('span', { class: 'chip ' + (sq.long < 20 ? 'warn' : ''), title: 'SauceNAO lookups left today' }, `SauceNAO ${sq.long} left`));
   el.append(...parts);
@@ -119,7 +152,8 @@ function buildLog(initial) {
     api.call('settings:set', { logOpen: open });
     lines.scrollTop = lines.scrollHeight;
   } });
-  head.append(icon('log'), h('span', null, 'Activity'), last, caretHost);
+  const clearBtn = h('button', { class: 'btn sm ghost', title: 'Clear the activity log', onclick: (e) => { e.stopPropagation(); clear(lines); last.textContent = ''; api.call('log:clear'); } }, 'Clear');
+  head.append(icon('log'), h('span', null, 'Activity'), last, clearBtn, caretHost);
   bar.append(head, lines);
   if (state.settings.logOpen) bar.classList.add('open');
   const add = (l) => {
@@ -158,21 +192,27 @@ async function init() {
     viewsEl.appendChild(el);
     views[v.id] = { el };
   }
+  browser = new Browser();
   for (const v of VIEWS) views[v.id].inst = new v.cls(views[v.id].el);
+  state.lastDock = data.settings.dock && data.settings.dock !== 'closed' ? data.settings.dock : 'small';
+  on('dock', setDock);
+  on('open-url', openUrl);
+  on('search-in-tab', searchInTab);
+  document.addEventListener('keydown', (e) => browser.key(e), true);
   buildLog(data.log);
 
   on('show-view', showView);
   on('view-image', (p) => viewImage(fileUrl(p)));
   on('select-item', (id) => views.lookups.inst.select(id));
   // Browser shortcuts pressed while a web page has focus are forwarded from the main process.
-  api.on('browser:shortcut', (k) => { if (state.view === 'browser') views.browser.inst.shortcut(k); });
+  api.on('browser:shortcut', (k) => browser.shortcut(k));
   api.on('queue:status', (q) => { state.queue = q; renderStatus(); emit('queue'); });
   api.on('settings:changed', (s) => { state.settings = s; emit('settings', s); });
 
   // Ctrl+Z: undo the last sort from anywhere.
   document.addEventListener('keydown', async (e) => {
     if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z' && !/INPUT|TEXTAREA/.test(document.activeElement.tagName)) {
-      const last = state.sortLog.slice().reverse().find((l) => !l.undone);
+      const last = state.sortLog.slice().reverse().find((l) => !l.undone && l.kind !== 'gone' && !l.missingAt);
       if (!last) return;
       e.preventDefault();
       api.call('sort:undo', last.id).then(() => toast('Undid: ' + last.to.split(/[\\/]/).pop())).catch((x) => toast(x.message, 'error'));

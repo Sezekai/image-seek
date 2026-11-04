@@ -5,7 +5,7 @@ const SERVICES = ['1', '2', '3', '4', '5', '6', '11', '13']; // danbooru konacha
 
 function parse(html) {
   const out = [];
-  const pagesIdx = html.indexOf('id="pages"');
+  const pagesIdx = html.search(/id=['"]pages['"]/);
   const body = pagesIdx >= 0 ? html.slice(pagesIdx) : html;
   const tables = body.split(/<table[^>]*>/i).slice(1);
   for (const raw of tables) {
@@ -56,6 +56,12 @@ function idsFromUrl(u) {
   return ids;
 }
 
+class BusyError extends Error {}
+
+function pageText(html) {
+  return String(html || '').replace(/<script[\s\S]*?<\/script>|<style[\s\S]*?<\/style>/gi, ' ').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+}
+
 async function search(fetchImpl, image) {
   const fields = [{ name: 'MAX_FILE_SIZE', value: '8388608' }];
   for (const s of SERVICES) fields.push({ name: 'service[]', value: s });
@@ -63,11 +69,18 @@ async function search(fetchImpl, image) {
   const form = multipart(fields);
   const res = await fetchImpl('https://iqdb.org/', { method: 'POST', headers: { 'Content-Type': form.contentType }, body: form.body });
   const html = await res.text();
+  const hasPages = /id=['"]pages['"]/.test(html);
+  const text = pageText(html);
+  // IQDB sometimes answers with a "heavy load, you are in the queue" page instead of results.
+  if (res.status === 429 || res.status === 503 || res.status === 502 || (!hasPages && /heavy load|in (the )?queue|queue position|overload|too many|try again (later|in)|busy/i.test(text))) {
+    throw new BusyError('IQDB is under heavy load — will try again later');
+  }
   if (!res.ok) throw new Error(`IQDB error ${res.status}`);
-  if (/too large|not an image|can't read/i.test(html) && !/id="pages"/.test(html)) {
-    throw new Error('IQDB could not read the image');
+  if (!hasPages) {
+    if (/too large|not an image|can.?t read|invalid|unsupported|no file/i.test(text)) throw new Error('IQDB could not read the image (' + text.slice(0, 120) + ')');
+    throw new BusyError('IQDB returned an unexpected page — will try again later');
   }
   return { results: parse(html) };
 }
 
-module.exports = { search, parse, idsFromUrl };
+module.exports = { search, parse, idsFromUrl, BusyError };

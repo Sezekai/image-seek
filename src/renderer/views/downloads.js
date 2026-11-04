@@ -118,10 +118,10 @@ export class DownloadsView {
 
   chooseLink(e, d) {
     const r = e.target.getBoundingClientRect();
-    const list = [...state.items.values()].filter((s) => s.status !== 'done' && s.status !== 'sorted' && s.id !== d.itemId)
-      .sort((a, b) => (b.mode === 'upgrade') - (a.mode === 'upgrade') || b.addedAt - a.addedAt).slice(0, 60);
+    const list = [...state.items.values()].filter((s) => s.status !== 'done' && s.id !== d.itemId)
+      .sort((a, b) => (b.pendingDownloads || 0) - (a.pendingDownloads || 0) || b.addedAt - a.addedAt).slice(0, 60);
     if (!list.length) { toast('No files to link to', 'warn'); return; }
-    popupMenu(r.left, r.bottom + 4, list.map((s) => ({ label: `${s.name}${s.mode === 'upgrade' ? '' : '  (identify)'}`, img: thumbUrl(s.path, 64), run: () => this.relink(d, s.id) })));
+    popupMenu(r.left, r.bottom + 4, list.map((s) => ({ label: s.name, img: thumbUrl(s.path, 64), run: () => this.relink(d, s.id) })));
   }
 
   async relink(d, itemId) {
