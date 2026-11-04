@@ -212,7 +212,7 @@ async function init() {
   // Ctrl+Z: undo the last sort from anywhere.
   document.addEventListener('keydown', async (e) => {
     if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z' && !/INPUT|TEXTAREA/.test(document.activeElement.tagName)) {
-      const last = state.sortLog.slice().reverse().find((l) => !l.undone && l.kind !== 'gone' && !l.missingAt);
+      const last = state.sortLog.slice().reverse().find((l) => !l.undone && l.kind !== 'gone' && l.kind !== 'moved' && !l.missingAt);
       if (!last) return;
       e.preventDefault();
       api.call('sort:undo', last.id).then(() => toast('Undid: ' + last.to.split(/[\\/]/).pop())).catch((x) => toast(x.message, 'error'));

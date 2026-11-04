@@ -14,6 +14,16 @@ const fo = require('./fileops');
 const { getImageInfo } = require('./imageinfo');
 
 const newId = () => crypto.randomBytes(5).toString('hex');
+
+// A file's identity on Windows (volume serial + NTFS file index). It survives renames and moves
+// on the same drive, which lets the app follow files you rename or move in Explorer.
+async function fidOf(p) {
+  try {
+    const st = await fsp.stat(p, { bigint: true });
+    if (!st.isFile() || !st.ino) return null; // FAT/exFAT drives have no stable index
+    return `${st.dev}:${st.ino}`;
+  } catch { return null; }
+}
 const DAY = 24 * 60 * 60 * 1000;
 const LOG_KEEP_MISSING = 30 * DAY;
 
@@ -91,10 +101,26 @@ class Library {
 
   // ---------- batches ----------
   async addBatch(folder, recursive) {
-    const files = await fo.listImages(folder, recursive);
-    const known = new Set(Object.values(this.d.items).filter((i) => i.status !== 'done').map((i) => i.path.toLowerCase()));
-    const batch = { id: newId(), folder, recursive: !!recursive, created: Date.now(), name: path.basename(folder) || folder };
-    let added = 0;
+    const existing = this.d.batches.find((b) => samePath(b.folder, folder));
+    const batch = existing || { id: newId(), folder, recursive: !!recursive, created: Date.now(), name: path.basename(folder) || folder };
+    if (existing) existing.recursive = existing.recursive || !!recursive;
+    else this.d.batches.push(batch);
+    const files = await fo.listImages(folder, batch.recursive);
+    const added = await this.addFiles(batch, files);
+    this.changed([]);
+    return { batch, added: added.length, skipped: files.length - added.length };
+  }
+
+  knownPaths() {
+    const known = new Set();
+    for (const i of Object.values(this.d.items)) known.add(i.path.toLowerCase());
+    for (const d of Object.values(this.d.downloads)) if (d.path) known.add(d.path.toLowerCase());
+    return known;
+  }
+
+  async addFiles(batch, files) {
+    const known = this.knownPaths();
+    const added = [];
     for (const f of files) {
       if (known.has(f.toLowerCase())) continue;
       const it = {
@@ -102,13 +128,12 @@ class Library {
         status: 'queued', phase: 'lookup', engines: {}, results: [], downloads: [], addedAt: Date.now(),
       };
       try { Object.assign(it, pickInfo(await getImageInfo(f))); } catch (_) { /* unreadable header */ }
+      it.fid = await fidOf(f);
       this.d.items[it.id] = it;
-      added++;
+      known.add(f.toLowerCase());
+      added.push(it);
     }
-    batch.added = added;
-    this.d.batches.push(batch);
-    this.changed([]);
-    return { batch, added, skipped: files.length - added };
+    return added;
   }
 
   removeBatch(batchId) {
@@ -119,14 +144,6 @@ class Library {
     }
     this.d.batches = this.d.batches.filter((b) => b.id !== batchId);
     this.changed([]);
-  }
-
-  // Drop batches that no longer have any files listed.
-  pruneBatches() {
-    const used = new Set(Object.values(this.d.items).map((i) => i.batchId));
-    const before = this.d.batches.length;
-    this.d.batches = this.d.batches.filter((b) => used.has(b.id));
-    return before !== this.d.batches.length;
   }
 
   requeue(id, engines) {
@@ -202,6 +219,7 @@ class Library {
     if (savePath) dl.path = savePath;
     if (state === 'completed') {
       try { Object.assign(dl, pickInfo(await getImageInfo(dl.path))); } catch (_) { /* not an image */ }
+      dl.fid = await fidOf(dl.path);
     } else {
       this.detachDownload(dl);
       delete this.d.downloads[id];
@@ -234,7 +252,7 @@ class Library {
     const oldItem = dl.itemId;
     const target = itemId ? this.item(itemId) : null;
     const destDir = target ? this.itemFolder(target) : this.unlinkedFolder();
-    if (await fo.exists(dl.path)) dl.path = await fo.moveFile(dl.path, destDir);
+    if (await fo.exists(dl.path)) { dl.path = await fo.moveFile(dl.path, destDir); dl.name = path.basename(dl.path); dl.fid = await fidOf(dl.path); }
     this.detachDownload(dl);
     dl.itemId = target ? target.id : null;
     dl.dist = undefined;
@@ -336,7 +354,9 @@ class Library {
       if (it.originalSorted || this.originalGone(it)) throw new Error('The original has already been dealt with');
       const src = it.path;
       const dest = await fo.moveFile(src, destDir);
-      logEntry = { id: newId(), time: Date.now(), kind: 'item', refId: it.id, name: it.name, from: src, to: dest, folder: destRel, flags };
+      const fid = await fidOf(dest);
+      logEntry = { id: newId(), time: Date.now(), kind: 'item', refId: it.id, name: it.name, from: src, to: dest, folder: destRel, flags, fid };
+      it.fid = fid;
       it.path = dest;
       it.sortedTo = destRel;
       it.originalSorted = true;
@@ -349,7 +369,8 @@ class Library {
       const dest = await fo.moveFile(src, destDir);
       dl.path = dest;
       dl.sortedTo = destRel;
-      logEntry = { id: newId(), time: Date.now(), kind: 'download', refId: dl.id, name: dl.name, from: src, to: dest, folder: destRel, flags, download: { ...dl } };
+      dl.fid = await fidOf(dest);
+      logEntry = { id: newId(), time: Date.now(), kind: 'download', refId: dl.id, name: dl.name, from: src, to: dest, folder: destRel, flags, fid: dl.fid, download: { ...dl } };
       const it = dl.itemId && this.item(dl.itemId);
       if (it) {
         await this.cleanupItemFolder(it.id);
@@ -383,24 +404,27 @@ class Library {
     const l = this.d.sortLog.find((x) => x.id === logId);
     if (!l) throw new Error('Log entry not found');
     if (l.undone) throw new Error('Already undone');
-    if (l.missingAt || l.kind === 'gone') throw new Error('That file was moved or deleted outside Image Seek, so it can\'t be undone');
+    if (l.missingAt || l.kind === 'gone' || l.kind === 'moved') throw new Error('That file was moved or deleted outside Image Seek, so it can\'t be undone');
     if (!(await fo.exists(l.to))) {
       l.missingAt = Date.now();
       this.changed([]);
       throw new Error('The sorted file is no longer there, so it can\'t be moved back');
     }
     await fo.moveToExact(l.to, l.from);
+    const fid = await fidOf(l.from);
     if (l.kind === 'item') {
       const it = this.item(l.refId);
       if (it) {
         it.path = l.from;
+        it.name = path.basename(l.from);
+        it.fid = fid;
         it.sortedTo = null;
         it.originalSorted = false;
         await this.checkItemDone(it);
         this.changed(it.id);
       }
     } else {
-      const dl = { ...(l.download || {}), id: l.refId, path: l.from, sortedTo: null };
+      const dl = { ...(l.download || {}), id: l.refId, path: l.from, name: path.basename(l.from), sortedTo: null, fid };
       const it = dl.itemId && this.item(dl.itemId);
       if (!it) dl.itemId = null;
       this.d.downloads[dl.id] = dl;
@@ -437,7 +461,6 @@ class Library {
       if (dl) { if (dl.sortedTo) delete this.d.downloads[dlId]; else dl.itemId = null; }
     }
     delete this.d.items[id];
-    this.pruneBatches();
     this.changed([]);
   }
 
@@ -447,95 +470,311 @@ class Library {
       this.dropSortedDownloads(it);
       delete this.d.items[id];
     }
-    this.pruneBatches();
     this.changed([]);
   }
 
-  // ---------- files moved or deleted outside the app ----------
-  // Anything that has disappeared is removed from the app and noted in the log. Those log
-  // lines (and sort entries whose file is gone) are dropped after 30 days.
+  // ---------- files renamed, moved or deleted outside the app ----------
+  // Every tracked file is checked. One that's gone from its path is looked for by its file ID
+  // (recent folder-watch events, its old folder, then the watched folders). If found, the app
+  // follows it: moving it into the sort folder counts as sorting it, moving a sorted file to
+  // another sorted folder updates the log (undo still works), moving it out of the sort folder
+  // un-sorts it. If it can't be found it's removed from the app and noted in the log.
+  // "gone" / "moved" lines and missing sort entries drop off the log after 30 days.
   async checkMissing() {
     if (this.checking) return 0;
     this.checking = true;
     let changes = 0;
-    const touched = new Set();
     try {
+      const missing = [];
       const jobs = [];
-      const gone = (kind, name, p, extra) => {
-        this.pushLog({ id: newId(), time: Date.now(), kind: 'gone', what: kind, name, from: p, to: null, ...extra });
-        changes++;
-      };
-      // originals still in their lookup folder
+      const watch = (kind, ref, p) => jobs.push(async () => {
+        const fid = await fidOf(p);
+        if (fid) { if (ref.fid !== fid) { ref.fid = fid; } return; }
+        if (await fo.exists(p)) return; // exists but has no stable ID (e.g. FAT drive)
+        missing.push({ kind, ref, path: p, fid: ref.fid || null });
+      });
       for (const it of Object.values(this.d.items)) {
-        if (it.status === 'done' && !it.originalSorted) continue;
         if (this.originalGone(it)) continue;
-        jobs.push(async () => {
-          if (await fo.exists(it.path)) return;
-          if (!this.d.items[it.id]) return;
-          if (it.originalSorted) {
-            // A sorted original that's gone: its log entry is marked below; forget the done item.
-            if (it.status === 'done') { delete this.d.items[it.id]; changes++; }
-            return;
-          }
-          gone('original', it.name, it.path);
-          it.originalMissing = true;
-          touched.add(it.id);
-          const anyDownloads = (it.downloads || []).some((id) => this.d.downloads[id] && !this.d.downloads[id].sortedTo);
-          if (!anyDownloads) { this.forgetItemQuiet(it); }
-          else await this.checkItemDone(it);
-        });
+        if (it.originalSorted) continue; // followed through its log entry
+        watch('item', it, it.path);
       }
-      // downloads (linked and unlinked) waiting to be dealt with
       for (const dl of Object.values(this.d.downloads)) {
         if (dl.state !== 'completed' || dl.sortedTo) continue;
-        jobs.push(async () => {
-          if (await fo.exists(dl.path)) return;
-          if (!this.d.downloads[dl.id]) return;
-          gone(dl.itemId ? 'download' : 'unlinked', dl.name || path.basename(dl.path), dl.path);
-          this.detachDownload(dl);
-          delete this.d.downloads[dl.id];
-          const it = dl.itemId && this.item(dl.itemId);
-          if (it) {
-            touched.add(it.id);
-            await this.cleanupItemFolder(it.id);
-            if (this.originalGone(it) && !this.pendingDownloads(it).length && !it.originalSorted && !(it.downloads || []).length) this.forgetItemQuiet(it);
-            else await this.checkItemDone(it);
-          }
-        });
+        watch('download', dl, dl.path);
       }
-      // sorted files
       for (const l of this.d.sortLog) {
-        if (l.kind === 'gone' || l.undone || l.missingAt) continue;
-        jobs.push(async () => {
-          if (await fo.exists(l.to)) return;
-          l.missingAt = Date.now();
-          changes++;
-          if (l.kind === 'download' && this.d.downloads[l.refId] && this.d.downloads[l.refId].sortedTo) {
-            const dl = this.d.downloads[l.refId];
-            this.detachDownload(dl);
-            delete this.d.downloads[l.refId];
-          }
-          if (l.kind === 'item') {
-            const it = this.item(l.refId);
-            if (it && it.status === 'done' && it.path === l.to) delete this.d.items[it.id];
-          }
-        });
+        if (l.kind === 'gone' || l.kind === 'moved' || l.undone || l.missingAt) continue;
+        watch('log', l, l.to);
       }
       await runLimited(jobs, 24);
-      // purge old missing / gone lines
+
+      if (missing.length) {
+        const found = await this.locate(missing.filter((m) => m.fid));
+        for (const m of missing) {
+          const np = m.fid && found.get(m.fid);
+          // still really gone? (it may have come back while we looked)
+          if (!np && await fo.exists(m.path)) continue;
+          if (np) await this.follow(m, np); else await this.lose(m);
+          changes++;
+        }
+      }
+
+      // purge old lines
       const now = Date.now();
       const before = this.d.sortLog.length;
       this.d.sortLog = this.d.sortLog.filter((l) => {
-        const t = l.kind === 'gone' ? l.time : l.missingAt;
+        const t = l.kind === 'gone' || l.kind === 'moved' ? l.time : l.missingAt;
         return !t || now - t < LOG_KEEP_MISSING;
       });
       if (this.d.sortLog.length !== before) changes++;
-      if (this.pruneBatches()) changes++;
     } finally {
       this.checking = false;
     }
     if (changes) this.changed([]);
     return changes;
+  }
+
+  // Finds current paths for file IDs. Returns Map fid -> path.
+  async locate(wanted) {
+    const out = new Map();
+    if (!wanted.length) return out;
+    const need = new Set(wanted.map((m) => m.fid));
+    // 1. files the folder watcher saw appear recently
+    for (const [fid, p] of this.appeared || []) {
+      if (need.has(fid) && (await fidOf(p)) === fid) { out.set(fid, p); need.delete(fid); }
+    }
+    if (!need.size) return out;
+    // 2. the file's old folder (renamed in place)
+    const dirs = [...new Set(wanted.filter((m) => need.has(m.fid)).map((m) => path.dirname(m.path)))];
+    for (const d of dirs) {
+      let names;
+      try { names = await fsp.readdir(d); } catch { continue; }
+      if (names.length > 20000) continue;
+      for (const n of names) {
+        if (!fo.isImage(n)) continue;
+        const p = path.join(d, n);
+        const fid = await fidOf(p);
+        if (fid && need.has(fid)) { out.set(fid, p); need.delete(fid); }
+      }
+      if (!need.size) return out;
+    }
+    // 3. every watched folder. A cached index is tried first, then a fresh scan (only happens
+    //    when something newly went missing, since afterwards it's followed or marked gone).
+    const before = this.indexAt;
+    let index = await this.folderIndex();
+    let fresh = this.indexAt !== before; // built just now
+    for (;;) {
+      for (const fid of [...need]) {
+        const p = index.get(fid);
+        if (p && (await fidOf(p)) === fid) { out.set(fid, p); need.delete(fid); }
+      }
+      if (!need.size || fresh) break;
+      index = await this.folderIndex(true);
+      fresh = true;
+    }
+    return out;
+  }
+
+  watchedRoots() {
+    const s = this.settings.get();
+    const roots = this.d.batches.map((b) => ({ path: b.folder, recursive: !!b.recursive }));
+    if (s.downloadsDir) roots.push({ path: s.downloadsDir, recursive: true });
+    if (s.sortRoot) roots.push({ path: s.sortRoot, recursive: true });
+    return roots;
+  }
+
+  async folderIndex(force) {
+    if (!force && this.index && Date.now() - this.indexAt < 5 * 60 * 1000) return this.index;
+    const map = new Map();
+    for (const r of this.watchedRoots()) {
+      const files = await fo.listImages(r.path, r.recursive);
+      await runLimited(files.map((f) => async () => { const fid = await fidOf(f); if (fid) map.set(fid, f); }), 32);
+    }
+    this.index = map;
+    this.indexAt = Date.now();
+    return map;
+  }
+
+  inSortRoot(p) {
+    const root = this.settings.get().sortRoot;
+    if (!root) return false;
+    const rel = path.relative(root, p);
+    return !!rel && !rel.startsWith('..') && !path.isAbsolute(rel);
+  }
+
+  // Folder (relative to the sort folder) and NSFW / Very flags for a file in the sort folder.
+  sortPlace(p) {
+    const rel = path.relative(this.settings.get().sortRoot, path.dirname(p));
+    const parts = rel.split(/[\\/]/).filter(Boolean);
+    const flags = { nsfw: false, very: false };
+    const last = (i) => (parts[parts.length - i] || '').toLowerCase();
+    if (last(1) === 'very' && last(2) === 'nsfw') { flags.nsfw = true; flags.very = true; parts.splice(-2); }
+    else if (last(1) === 'nsfw') { flags.nsfw = true; parts.pop(); }
+    return { folder: parts.join('/') || '(sort folder)', flags };
+  }
+
+  noteMoved(what, name, from, to) {
+    const renamed = path.dirname(from).toLowerCase() === path.dirname(to).toLowerCase();
+    this.pushLog({ id: newId(), time: Date.now(), kind: 'moved', what, renamed, name, from, to });
+  }
+
+  async follow(m, np) {
+    const fid = m.fid;
+    if (m.kind === 'item') {
+      const it = m.ref;
+      if (!this.d.items[it.id]) return;
+      const from = it.path;
+      it.path = np; it.name = path.basename(np); it.fid = fid;
+      if (this.inSortRoot(np)) {
+        // Moved into the sort folder by hand: counts as sorting it.
+        const pl = this.sortPlace(np);
+        it.originalSorted = true; it.sortedTo = pl.folder;
+        this.pushLog({ id: newId(), time: Date.now(), kind: 'item', manual: true, refId: it.id, name: it.name, from, to: np, folder: pl.folder, flags: pl.flags, fid });
+        await this.checkItemDone(it);
+      } else this.noteMoved('original', it.name, from, np);
+    } else if (m.kind === 'download') {
+      const dl = m.ref;
+      if (!this.d.downloads[dl.id]) return;
+      const from = dl.path;
+      dl.path = np; dl.name = path.basename(np); dl.fid = fid;
+      const it = dl.itemId && this.item(dl.itemId);
+      if (this.inSortRoot(np)) {
+        const pl = this.sortPlace(np);
+        dl.sortedTo = pl.folder;
+        this.pushLog({ id: newId(), time: Date.now(), kind: 'download', manual: true, refId: dl.id, name: dl.name, from, to: np, folder: pl.folder, flags: pl.flags, fid, download: { ...dl } });
+        if (it) {
+          await this.cleanupItemFolder(it.id);
+          await this.checkItemDone(it);
+          if (it.status === 'done') this.dropSortedDownloads(it);
+        } else delete this.d.downloads[dl.id];
+      } else {
+        this.noteMoved(dl.itemId ? 'download' : 'unlinked', dl.name, from, np);
+        if (it) await this.cleanupItemFolder(it.id);
+      }
+    } else if (m.kind === 'log') {
+      const l = m.ref;
+      const from = l.to;
+      const it = l.kind === 'item' ? this.item(l.refId) : null;
+      const dl = l.kind === 'download' ? this.d.downloads[l.refId] : null;
+      if (this.inSortRoot(np)) {
+        // Renamed, or moved to another sorted folder: keep the entry (undo moves it back from here).
+        const pl = this.sortPlace(np);
+        l.moves = (l.moves || []).concat({ time: Date.now(), from, to: np, folder: pl.folder });
+        l.to = np; l.folder = pl.folder; l.flags = pl.flags; l.fid = fid;
+        if (it && it.path === from) { it.path = np; it.name = path.basename(np); it.sortedTo = pl.folder; it.fid = fid; }
+        if (dl) { dl.path = np; dl.name = path.basename(np); dl.sortedTo = pl.folder; dl.fid = fid; }
+      } else {
+        // Moved back out of the sort folder: it's no longer sorted.
+        l.undone = true;
+        l.movedOut = { time: Date.now(), to: np };
+        if (it && it.path === from) {
+          it.path = np; it.name = path.basename(np); it.fid = fid;
+          it.originalSorted = false; it.sortedTo = null;
+          await this.checkItemDone(it);
+        }
+        if (dl) {
+          dl.path = np; dl.name = path.basename(np); dl.sortedTo = null; dl.fid = fid;
+          const owner = dl.itemId && this.item(dl.itemId);
+          if (owner) await this.checkItemDone(owner);
+        }
+      }
+    }
+  }
+
+  async lose(m) {
+    const gone = (what, name, p) => this.pushLog({ id: newId(), time: Date.now(), kind: 'gone', what, name, from: p, to: null });
+    if (m.kind === 'item') {
+      const it = m.ref;
+      if (!this.d.items[it.id]) return;
+      gone('original', it.name, it.path);
+      it.originalMissing = true;
+      const anyDownloads = (it.downloads || []).some((id) => this.d.downloads[id] && !this.d.downloads[id].sortedTo);
+      if (!anyDownloads) this.forgetItemQuiet(it);
+      else await this.checkItemDone(it);
+    } else if (m.kind === 'download') {
+      const dl = m.ref;
+      if (!this.d.downloads[dl.id]) return;
+      gone(dl.itemId ? 'download' : 'unlinked', dl.name || path.basename(dl.path), dl.path);
+      this.detachDownload(dl);
+      delete this.d.downloads[dl.id];
+      const it = dl.itemId && this.item(dl.itemId);
+      if (it) {
+        await this.cleanupItemFolder(it.id);
+        if (this.originalGone(it) && !it.originalSorted && !(it.downloads || []).length) this.forgetItemQuiet(it);
+        else await this.checkItemDone(it);
+      }
+    } else if (m.kind === 'log') {
+      const l = m.ref;
+      l.missingAt = Date.now();
+      if (l.kind === 'download' && this.d.downloads[l.refId] && this.d.downloads[l.refId].sortedTo) {
+        const dl = this.d.downloads[l.refId];
+        this.detachDownload(dl);
+        delete this.d.downloads[l.refId];
+      }
+      if (l.kind === 'item') {
+        const it = this.item(l.refId);
+        if (it && it.path === l.to) {
+          if (it.status === 'done') delete this.d.items[it.id];
+          else { it.originalMissing = true; await this.checkItemDone(it); }
+        }
+      }
+    }
+  }
+
+  // ---------- new images in added folders ----------
+  // paths: specific files the watcher reported, or null to rescan every added folder.
+  async pickUpNew(paths) {
+    if (this.settings.get().autoAdd === false) return [];
+    const s = this.settings.get();
+    const skip = (p) => [s.downloadsDir, s.sortRoot, this.paths.data].some((r) => r && isInside(r, p));
+    const added = [];
+    for (const b of this.d.batches) {
+      let files;
+      if (paths) {
+        files = paths.filter((p) => fo.isImage(p) && isInside(b.folder, p) && (b.recursive || samePath(path.dirname(p), b.folder)));
+      } else {
+        if (!(await fo.exists(b.folder))) continue;
+        files = await fo.listImages(b.folder, b.recursive);
+      }
+      files = files.filter((p) => !skip(p));
+      if (!files.length) continue;
+      // Ignore files still being copied in; the watcher will report them again.
+      const ready = [];
+      for (const f of files) {
+        try {
+          const st = await fsp.stat(f);
+          if (st.isFile() && st.size > 0 && Date.now() - st.mtimeMs > 1500) ready.push(f);
+          else if (st.isFile()) this.later = (this.later || new Set()).add(f);
+        } catch { /* gone again */ }
+      }
+      const got = await this.addFiles(b, ready);
+      if (got.length) { b.picked = (b.picked || 0) + got.length; added.push(...got); }
+    }
+    if (added.length) this.changed([]);
+    return added;
+  }
+
+  // Watcher / timer entry point: follow renamed or moved files first, then add new ones.
+  async reconcile(paths) {
+    if (this.reconciling) {
+      this.again = this.again === undefined ? (paths ? [...paths] : null) : (this.again === null || !paths ? null : this.again.concat(paths));
+      return { changes: 0, added: [] };
+    }
+    this.reconciling = true;
+    try {
+      const changes = await this.checkMissing();
+      let todo = paths;
+      if (this.later && this.later.size) { todo = todo ? todo.concat([...this.later]) : todo; this.later.clear(); }
+      const added = await this.pickUpNew(todo);
+      return { changes, added };
+    } finally {
+      this.reconciling = false;
+      if (this.again !== undefined) {
+        const again = this.again;
+        this.again = undefined;
+        setTimeout(() => this.reconcile(again).then((r) => this.onReconciled && this.onReconciled(r)), 50);
+      }
+    }
   }
 
   forgetItemQuiet(it) {
@@ -545,6 +784,12 @@ class Library {
     }
     delete this.d.items[it.id];
   }
+}
+
+function samePath(a, b) { return path.resolve(a).toLowerCase() === path.resolve(b).toLowerCase(); }
+function isInside(root, p) {
+  const rel = path.relative(path.resolve(root).toLowerCase(), path.resolve(p).toLowerCase());
+  return !!rel && !rel.startsWith('..') && !path.isAbsolute(rel);
 }
 
 async function runLimited(jobs, n) {
@@ -560,4 +805,4 @@ function pickInfo(info) {
   };
 }
 
-module.exports = { Library, newId, LOG_KEEP_MISSING };
+module.exports = { Library, newId, LOG_KEEP_MISSING, fidOf };

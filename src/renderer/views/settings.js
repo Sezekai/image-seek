@@ -34,6 +34,8 @@ export class SettingsView {
     this.wrap.appendChild(h('div', { class: 'card' }, h('h2', null, icon('folder'), 'Folders'),
       this.folderField('Downloads', 'downloadsDir', 'Each file you look up for a higher resolution gets its own subfolder here. Stray downloads go to "_Unlinked".'),
       this.folderField('Sort folder', 'sortRoot', 'Sorted files go into your folders inside this one (with NSFW / Very subfolders when switched on).'),
+      this.field('New images', h('label', { class: 'toggle' }, h('input', { type: 'checkbox', checked: s.autoAdd !== false, onchange: (e) => this.set({ autoAdd: e.target.checked }) }), 'Pick up new images saved into added folders automatically'),
+        'Renamed and moved files are followed either way (on the same drive).'),
       this.field('App data', h('div', { class: 'row' }, h('div', { class: 'input ell grow', style: { display: 'flex', alignItems: 'center' } }, state.paths.data),
         btn('', { icon: 'external', title: 'Open', onclick: () => api.call('shell:open', state.paths.data) })), 'Settings, the file list, browser profile, logins and caches. Kept outside the App folder so new versions pick it up.')));
 

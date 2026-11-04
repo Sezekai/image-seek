@@ -27,14 +27,15 @@ export class LookupsView {
       { value: 'bigger', label: 'Larger found', title: 'Files where a lookup found a bigger version' },
       { value: 'downloads', label: 'Has downloads', title: 'Files with downloaded versions waiting' },
     ], this.extra, (v) => { this.extra = v; this.apply(); });
-    this.batchSel = h('select', { class: 'input', style: { maxWidth: '220px' }, onchange: () => { this.batch = this.batchSel.value; this.apply(); } });
+    this.batchSel = h('select', { class: 'input', style: { maxWidth: '220px' }, onchange: () => { this.batch = this.batchSel.value; this.renderBatchBtn(); this.apply(); } });
+    this.batchRemove = btn('', { icon: 'x', cls: 'hidden', title: 'Remove this folder from Image Seek (stops picking up new images; files with downloads stay)', onclick: () => this.removeBatch() });
     this.search = h('input', { class: 'input search', placeholder: 'Search name, series, character, artist', style: { flex: '1 1 140px', minWidth: '120px', maxWidth: '300px' }, oninput: () => { this.q = this.search.value.trim().toLowerCase(); this.apply(); } });
     this.queueBtn = btn('Pause', { icon: 'pause', onclick: () => this.toggleQueue() });
     this.retryBtn = btn('Retry', { icon: 'reload', title: 'Retry failed or blocked lookups', onclick: (e) => this.retryMenu(e) });
     this.browserBtn = btn('Browser', { icon: 'globe', title: 'Show or hide the browser next to the files', onclick: () => emit('dock', this.dock === 'closed' ? (state.lastDock || 'small') : 'closed') });
     this.toolbar = h('div', { class: 'toolbar' },
       btn('Add folder', { icon: 'plus', cls: 'primary', onclick: () => this.addFolder() }),
-      this.batchSel,
+      this.batchSel, this.batchRemove,
       h('div', { class: 'vsep' }),
       this.statusSeg, this.extraSeg,
       this.search,
@@ -91,6 +92,21 @@ export class LookupsView {
     }
     this.batchSel.value = state.batches.some((b) => b.id === cur) ? cur : 'all';
     this.batch = this.batchSel.value;
+    this.renderBatchBtn();
+  }
+
+  renderBatchBtn() {
+    this.batchRemove.classList.toggle('hidden', this.batch === 'all');
+    const b = state.batches.find((x) => x.id === this.batch);
+    this.batchSel.title = b ? b.folder + (state.settings.autoAdd !== false ? '\nNew images saved here are picked up automatically' : '') : '';
+  }
+
+  async removeBatch() {
+    const b = state.batches.find((x) => x.id === this.batch);
+    if (!b) return;
+    if (!(await confirmBox('Remove this folder?', `${b.folder}\n\nIts files leave the list (ones with downloads stay) and new images saved there won't be picked up any more. Nothing on disk changes.`, 'Remove'))) return;
+    await safe(() => api.call('batch:remove', b.id), 'Folder removed');
+    this.batch = 'all';
   }
 
   matches(s) {
@@ -304,6 +320,7 @@ export class LookupsView {
       h('div', { class: 'row' }, pathEl, btn('Browse…', { icon: 'folder', onclick: choose })),
       h('label', { class: 'check' }, sub, 'Include subfolders'),
       h('div', { class: 'xs dim' }, 'Each file is looked up for its series, characters, artist and any larger versions. Sort it straight away, or download better versions and compare. Files stay where they are until you sort or recycle them.'),
+      state.settings.autoAdd !== false ? h('div', { class: 'xs dim' }, 'New images saved into this folder later are added and looked up automatically. Adding a folder that\'s already listed just picks up anything new.') : null,
     ], [{ label: 'Cancel', value: () => null }, { label: 'Add and look up', primary: true, value: () => 'ok' }]);
     if (r !== 'ok' || !folder) return;
     if (recursive !== state.settings.includeSubfolders) state.settings = await api.call('settings:set', { includeSubfolders: recursive });

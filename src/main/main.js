@@ -12,6 +12,7 @@ const { Library } = require('./library');
 const { LookupQueue } = require('./lookup/queue');
 const { BrowserManager, PARTITION } = require('./browser');
 const { PasswordStore } = require('./passwords');
+const { FolderWatcher } = require('./watcher');
 const firefox = require('./firefox');
 const { findCollectionSorterKey } = require('./keyimport');
 const { getImageInfo } = require('./imageinfo');
@@ -31,7 +32,7 @@ protocol.registerSchemesAsPrivileged([
 ]);
 
 let win = null;
-let settings, lib, queue, browser, passwords;
+let settings, lib, queue, browser, passwords, watcher;
 const logLines = [];
 const logFile = path.join(paths.data, 'image-seek.log');
 
@@ -246,6 +247,8 @@ function setupIpc() {
     const before = { ...settings.get() };
     const s = settings.set(patch);
     if ('adblock' in patch && patch.adblock !== before.adblock) await browser.applyAdblock();
+    if ('downloadsDir' in patch || 'sortRoot' in patch) { lib.index = null; watcher.refresh(); }
+    if ('autoAdd' in patch && patch.autoAdd) lib.reconcile(null).then(lib.onReconciled).catch(() => {});
     if ('queuePaused' in patch && !patch.queuePaused) queue.kick();
     if ('engines' in patch || 'saucenaoKey' in patch) queue.kick();
     if ('minSimilarity' in patch) {
@@ -276,11 +279,12 @@ function setupIpc() {
 
   handle('batch:add', async (folder, recursive) => {
     const r = await lib.addBatch(folder, recursive);
-    log(`Added ${r.added} file(s) from ${folder}${r.skipped ? ` (${r.skipped} already in the list)` : ''}`);
+    log(`Added ${r.added} file(s) from ${folder}${r.skipped ? ` (${r.skipped} already in the list)` : ''} — new images saved there later are picked up automatically`);
+    watcher.refresh();
     queue.kick();
     return { added: r.added, skipped: r.skipped, batchId: r.batch.id };
   });
-  handle('batch:remove', async (id) => lib.removeBatch(id));
+  handle('batch:remove', async (id) => { lib.removeBatch(id); watcher.refresh(); });
 
   handle('lib:snapshot', async () => lib.snapshot());
   handle('lib:light', async () => lib.light());
@@ -451,18 +455,32 @@ app.whenReady().then(async () => {
   }
   win.webContents.once('did-finish-load', () => setTimeout(() => queue.kick(), 1500));
   // Files moved or deleted outside the app drop out of it (checked every 20 s and on focus).
-  let lastCheck = 0;
-  const check = async () => {
-    if (Date.now() - lastCheck < 4000) return;
-    lastCheck = Date.now();
-    try {
-      const n = await lib.checkMissing();
-      if (n) queue.pushStatus();
-    } catch (e) { log('File check failed: ' + e.message, 'warn'); }
+  // Follow files renamed / moved outside the app, drop ones that are gone, and pick up new
+  // images saved into added folders: live from folder watching, every 20 s, on focus, and with a
+  // full rescan of the added folders at start and every 5 minutes.
+  const onReconciled = (r) => {
+    if (!r) return;
+    if (r.added && r.added.length) {
+      const byBatch = new Map();
+      for (const it of r.added) { const b = lib.d.batches.find((x) => x.id === it.batchId); const k = b ? b.name : 'a folder'; byBatch.set(k, (byBatch.get(k) || 0) + 1); }
+      for (const [k, n] of byBatch) log(`Picked up ${n} new image${n === 1 ? '' : 's'} in ${k}`);
+      queue.kick();
+    }
+    if (r.changes || (r.added && r.added.length)) queue.pushStatus();
   };
-  setInterval(check, 20000);
-  win.on('focus', check);
-  setTimeout(check, 3000);
+  lib.onReconciled = onReconciled;
+  watcher = new FolderWatcher(lib, onReconciled, log);
+  watcher.refresh();
+  let lastCheck = 0;
+  const check = async (full) => {
+    if (!full && Date.now() - lastCheck < 4000) return;
+    lastCheck = Date.now();
+    try { onReconciled(await lib.reconcile(full ? null : [])); } catch (e) { log('File check failed: ' + e.message, 'warn'); }
+  };
+  setInterval(() => check(false), 20000);
+  setInterval(() => { watcher.refresh(); check(true); }, 5 * 60 * 1000);
+  win.on('focus', () => check(false));
+  setTimeout(() => check(true), 3000);
 
   log(`Image Seek ${app.getVersion()} started — data in ${paths.data}`);
 });

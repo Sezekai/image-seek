@@ -365,6 +365,99 @@ test('retry failed lookups, per site', () => {
   assert.strictEqual(lib.d.items.b.engines.ascii2d, undefined);
 });
 
+const old = (p) => { const t = new Date(Date.now() - 60000); fs.utimesSync(p, t, t); };
+
+test('renamed and moved files are followed (option 1)', async () => {
+  const { lib, src, st } = makeLib();
+  await lib.addBatch(src, false);
+  const items = Object.values(lib.d.items).sort((a, b) => a.name.localeCompare(b.name));
+  const [one, three, two] = items;
+
+  // 1. original renamed in place -> followed, not re-added as a new file
+  fs.renameSync(path.join(src, 'one.jpg'), path.join(src, 'one-renamed.jpg'));
+  let r = await lib.reconcile(null);
+  assert.strictEqual(lib.item(one.id).path, path.join(src, 'one-renamed.jpg'));
+  assert.strictEqual(r.added.length, 0, 'not picked up as a new file');
+  assert.ok(lib.d.sortLog.some((l) => l.kind === 'moved' && l.renamed));
+
+  // 2. original moved into the sort folder by hand -> counts as sorted (NSFW flag read from the path)
+  fs.mkdirSync(path.join(st.sortRoot, 'Hololive', 'NSFW'), { recursive: true });
+  fs.renameSync(path.join(src, 'three.jpg'), path.join(st.sortRoot, 'Hololive', 'NSFW', 'three.jpg'));
+  await lib.reconcile([]);
+  const t = lib.item(three.id);
+  assert.strictEqual(t.status, 'done');
+  const manual = lib.d.sortLog.find((l) => l.refId === three.id && l.manual);
+  assert.strictEqual(manual.folder, 'Hololive');
+  assert.strictEqual(manual.flags.nsfw, true);
+
+  // 3. sorted by the app, then moved to another sorted folder -> log updated, undo still works
+  const e = await lib.sortFile({ kind: 'item', id: two.id }, 'Art', {});
+  fs.mkdirSync(path.join(st.sortRoot, 'Better Folder'), { recursive: true });
+  fs.renameSync(e.to, path.join(st.sortRoot, 'Better Folder', 'two-final.png'));
+  await lib.reconcile([]);
+  const entry = lib.d.sortLog.find((l) => l.id === e.id);
+  assert.strictEqual(entry.folder, 'Better Folder');
+  assert.ok(!entry.missingAt && entry.moves.length === 1);
+  await lib.undoSort(e.id);
+  assert.ok(fs.existsSync(path.join(src, 'two.png')), 'undo moved it back from the new place');
+
+  // 4. sorted file moved back out of the sort folder -> un-sorted
+  const e2 = await lib.sortFile({ kind: 'item', id: two.id }, 'Art', {});
+  const outside = path.join(path.dirname(src), 'elsewhere');
+  fs.mkdirSync(outside);
+  fs.renameSync(e2.to, path.join(outside, 'two.png'));
+  lib.index = null; // outside the watched folders: found via the folder watcher
+  lib.appeared = new Map([[await require('../src/main/library').fidOf(path.join(outside, 'two.png')), path.join(outside, 'two.png')]]);
+  await lib.reconcile([]);
+  assert.strictEqual(lib.item(two.id).originalSorted, false);
+  assert.notStrictEqual(lib.item(two.id).status, 'done');
+  assert.ok(lib.d.sortLog.find((l) => l.id === e2.id).movedOut);
+
+  // 5. a download renamed in its folder is followed
+  const f = lib.itemFolder(lib.item(one.id));
+  fs.mkdirSync(f, { recursive: true });
+  const pd = path.join(f, 'v.jpg');
+  fs.copyFileSync(path.join(FX, 'q85.jpg'), pd);
+  const d = lib.addDownload({ itemId: one.id, path: pd, name: 'v.jpg' });
+  await lib.finishDownload(d.id, 'completed');
+  fs.renameSync(pd, path.join(f, 'v-big.jpg'));
+  await lib.reconcile([]);
+  assert.strictEqual(lib.d.downloads[d.id].name, 'v-big.jpg');
+});
+
+test('new images in an added folder are picked up', async () => {
+  const { lib, src } = makeLib();
+  await lib.addBatch(src, false);
+  assert.strictEqual(Object.keys(lib.d.items).length, 3);
+  const n1 = path.join(src, 'new.png');
+  fs.copyFileSync(path.join(FX, 'a.png'), n1);
+  old(n1);
+  const busy = path.join(src, 'copying.jpg');
+  fs.copyFileSync(path.join(FX, 'q85.jpg'), busy); // just written: skipped until it settles
+  const sub = path.join(src, 'sub');
+  fs.mkdirSync(sub);
+  fs.copyFileSync(path.join(FX, 'q85.jpg'), path.join(sub, 'deep.jpg'));
+  old(path.join(sub, 'deep.jpg'));
+  let r = await lib.reconcile([n1, busy, path.join(sub, 'deep.jpg')]);
+  assert.deepStrictEqual(r.added.map((i) => i.name), ['new.png'], 'not recursive, busy file waits');
+  old(busy);
+  r = await lib.reconcile([]);
+  assert.deepStrictEqual(r.added.map((i) => i.name), ['copying.jpg'], 'settled file picked up on the next pass');
+  // full rescan finds nothing more; re-adding the folder with subfolders picks up the deep one
+  r = await lib.reconcile(null);
+  assert.strictEqual(r.added.length, 0);
+  const again = await lib.addBatch(src, true);
+  assert.strictEqual(again.added, 1);
+  assert.strictEqual(lib.d.batches.length, 1, 'same folder reuses its entry');
+  // turned off
+  lib.settings.get().autoAdd = false;
+  const n2 = path.join(src, 'n2.png');
+  fs.copyFileSync(path.join(FX, 'a.png'), n2);
+  old(n2);
+  r = await lib.reconcile(null);
+  assert.strictEqual(r.added.length, 0);
+});
+
 const iqdbMod = require('../src/main/lookup/iqdb');
 test('IQDB busy page is retried later, not failed', async () => {
   const fake = (html, status = 200) => async () => ({ status, ok: status < 400, text: async () => html });

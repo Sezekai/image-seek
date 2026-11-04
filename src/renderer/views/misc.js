@@ -3,6 +3,12 @@ import { api, state, h, icon, btn, clear, fmtTime, basename, dirname, toast, on,
 
 const DAY = 24 * 60 * 60 * 1000;
 
+function movesLabel(moves) {
+  const last = moves[moves.length - 1];
+  const renamed = dirname(last.from).toLowerCase() === dirname(last.to).toLowerCase();
+  return renamed ? 'renamed' : `moved to ${last.folder}`;
+}
+
 export class SortLogView {
   constructor(root) {
     this.root = root;
@@ -19,7 +25,7 @@ export class SortLogView {
     clear(this.listEl);
     const list = state.sortLog.slice().reverse().filter((l) => !this.q || `${l.from} ${l.to} ${l.folder} ${l.name}`.toLowerCase().includes(this.q));
     if (!list.length) this.listEl.appendChild(h('div', { class: 'empty' }, icon('log'), h('div', null, 'Nothing in the log.')));
-    for (const l of list.slice(0, 1500)) this.listEl.appendChild(l.kind === 'gone' ? this.goneRow(l) : this.sortRow(l));
+    for (const l of list.slice(0, 1500)) this.listEl.appendChild(l.kind === 'gone' ? this.goneRow(l) : l.kind === 'moved' ? this.movedRow(l) : this.sortRow(l));
   }
 
   daysLeft(t) { return Math.max(0, Math.ceil((t + 30 * DAY - Date.now()) / DAY)); }
@@ -36,6 +42,18 @@ export class SortLogView {
       h('span', { class: 'xs dim', style: { width: '70px' }, title: 'Removed from the log after 30 days' }, `${this.daysLeft(l.time)}d left`));
   }
 
+  movedRow(l) {
+    const what = { original: 'File', download: 'Linked download', unlinked: 'Unlinked download' }[l.what] || 'File';
+    return h('div', { class: 'list-row' },
+      h('img', { class: 'th', src: thumbUrl(l.to, 100), loading: 'lazy', onerror: (e) => { e.target.style.visibility = 'hidden'; } }),
+      h('div', { class: 'grow col', style: { gap: '1px' } },
+        h('div', { class: 'ell' }, basename(l.to)),
+        h('div', { class: 'xs dim ell', title: `${l.from}\n→ ${l.to}` }, l.renamed ? `was ${basename(l.from)}` : `${dirname(l.from)}  →  ${dirname(l.to)}`)),
+      h('span', { class: 'chip blue', title: 'Changed outside Image Seek — the app followed it' }, `${what} ${l.renamed ? 'renamed' : 'moved'}`),
+      h('span', { class: 'xs dim', style: { width: '110px', textAlign: 'right' } }, fmtTime(l.time)),
+      h('span', { class: 'xs dim', style: { width: '70px' }, title: 'Removed from the log after 30 days' }, `${this.daysLeft(l.time)}d left`));
+  }
+
   sortRow(l) {
     const flags = l.flags && l.flags.nsfw ? (l.flags.very ? ' › NSFW › Very' : ' › NSFW') : '';
     const missing = !!l.missingAt;
@@ -45,10 +63,13 @@ export class SortLogView {
       h('div', { class: 'grow col', style: { gap: '1px' } },
         h('div', { class: 'ell' }, basename(l.to)),
         h('div', { class: 'xs dim ell', title: `${l.from}\n→ ${l.to}` }, `${dirname(l.from)}  →  ${l.folder}${flags}`)),
-      missing ? h('span', { class: 'chip warn', title: 'The sorted file was moved, renamed or deleted outside Image Seek' }, 'no longer there') : null,
+      missing ? h('span', { class: 'chip warn', title: 'The sorted file was deleted (or moved to another drive) outside Image Seek' }, 'no longer there') : null,
+      l.manual ? h('span', { class: 'chip blue', title: 'You moved it into the sort folder outside Image Seek' }, 'sorted in Explorer') : null,
+      l.moves && l.moves.length ? h('span', { class: 'chip blue', title: l.moves.map((m) => `${fmtTime(m.time)}: ${m.from} → ${m.to}`).join('\n') }, movesLabel(l.moves)) : null,
+      l.movedOut ? h('span', { class: 'chip', title: l.movedOut.to }, 'moved out of the sort folder') : null,
       h('span', { class: 'chip' }, l.kind === 'item' ? 'original' : 'download'),
       h('span', { class: 'xs dim', style: { width: '110px', textAlign: 'right' } }, fmtTime(l.time)),
-      l.undone ? h('span', { class: 'xs dim', style: { width: '70px' } }, 'undone')
+      l.undone ? h('span', { class: 'xs dim', style: { width: '70px' } }, l.movedOut ? '' : 'undone')
         : missing ? h('span', { class: 'xs dim', style: { width: '70px' }, title: 'Removed from the log after 30 days' }, `${this.daysLeft(l.missingAt)}d left`)
           : btn('Undo', { icon: 'undo', cls: 'sm', onclick: () => api.call('sort:undo', l.id).then(() => toast('Moved back')).catch((e) => toast(e.message, 'error')) }));
   }

@@ -18,6 +18,7 @@ function defaults(paths) {
     siteThemes: {},
     lastSaveAsDir: '',
     dock: 'closed',
+    autoAdd: true,
     homepage: 'https://www.google.com/',
     uploadMaxSide: 3000,
     uploadMaxBytes: 4 * 1024 * 1024,
