@@ -1,5 +1,5 @@
 'use strict';
-const { app, BrowserWindow, ipcMain, dialog, shell, protocol, net, nativeImage, session, webContents: WC } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog, shell, protocol, net, nativeImage, session, Menu, webContents: WC } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const fsp = fs.promises;
@@ -103,6 +103,9 @@ function mouseNav(dir) {
   emit('browser:shortcut', dir);
 }
 ipcMain.on('page:mousenav', (_e, dir) => mouseNav(dir === 'forward' ? 'forward' : 'back'));
+// '/' pressed on a web page (not while typing in it) jumps to the sort box.
+ipcMain.on('page:hotkey', (_e, key) => { if (key === '/') emit('app:hotkey', '/'); });
+ipcMain.handle('win:fullscreen', () => { if (win) win.setFullScreen(!win.isFullScreen()); return win && win.isFullScreen(); });
 
 // ---------- protocols ----------
 function registerProtocols() {
@@ -424,6 +427,9 @@ function setupIpc() {
 
 // ---------- startup ----------
 app.whenReady().then(async () => {
+  // No window menu: its built-in accelerators (Ctrl+W closes the window, Ctrl+R reloads the
+  // whole app) clashed with the browser's shortcuts.
+  Menu.setApplicationMenu(null);
   registerProtocols();
   settings = new Settings(paths);
   lib = new Library(paths, settings, emit);

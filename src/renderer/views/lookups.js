@@ -49,7 +49,8 @@ export class LookupsView {
     this.grid.appendChild(this.inner);
     this.emptyEl = h('div', { class: 'empty hidden', style: { position: 'absolute', inset: '0' } });
     this.grid.appendChild(this.emptyEl);
-    this.gridPane = h('div', { class: 'gridpane' }, this.grid);
+    this.histHost = h('div', { class: 'hist-host hidden' }); // browser history covers the grid in the small view
+    this.gridPane = h('div', { class: 'gridpane' }, this.grid, this.histHost);
     makeResizable(this.gridPane, 'lookups-grid', 200, 1400, { left: true });
     this.slot = h('div', { class: 'bslot' });
     this.mainEl = h('div', { class: 'main lk-main dock-closed' }, this.gridPane, this.slot);
@@ -63,7 +64,6 @@ export class LookupsView {
 
     this.grid.addEventListener('scroll', () => this.renderVisible());
     new ResizeObserver(() => this.layout()).observe(this.grid);
-    this.grid.addEventListener('keydown', (e) => this.key(e));
   }
 
   statusOptions(counts = {}) {
@@ -198,7 +198,7 @@ export class LookupsView {
     const el = h('div', {
       class: 'tile' + (s.id === this.detail.id ? ' sel' : ''),
       style: { left: col * (this.tileW + GAP) + 'px', top: row * (TILE_H + GAP) + 'px', width: this.tileW + 'px', height: TILE_H + 'px' },
-      onclick: () => { this.select(s.id); this.grid.focus(); },
+      onclick: () => { this.select(s.id); if (document.activeElement && document.activeElement.blur) document.activeElement.blur(); },
       ondblclick: () => emit('view-image', s.path),
     },
     h('div', { class: 'thumb' }, this.thumbImg(s), tags),
@@ -243,15 +243,25 @@ export class LookupsView {
     this.ensureVisible(idx);
   }
 
-  key(e) {
-    if (e.target !== this.grid) return;
-    if (e.key === 'ArrowRight') { this.move(1); e.preventDefault(); }
-    else if (e.key === 'ArrowLeft') { this.move(-1); e.preventDefault(); }
-    else if (e.key === 'ArrowDown') { this.move(this.cols); e.preventDefault(); }
-    else if (e.key === 'ArrowUp') { this.move(-this.cols); e.preventDefault(); }
-    else if (e.key === 'Delete' && this.detail.item) { this.detail.recycle(); e.preventDefault(); }
-    else if (e.key === 'Enter' && this.detail.item) { emit('view-image', this.detail.item.path); }
-    else if (this.detail.keydown(e)) e.preventDefault();
+  // Called by the app's keyboard handler when this screen is showing and you're not typing.
+  handleKey(e) {
+    const k = e.key;
+    if (k === 'ArrowRight') { this.move(1); return true; }
+    if (k === 'ArrowLeft') { this.move(-1); return true; }
+    if (k === 'ArrowDown') { this.move(this.cols); return true; }
+    if (k === 'ArrowUp') { this.move(-this.cols); return true; }
+    if (k === 'Home') { this.move(-1e9); return true; }
+    if (k === 'End') { this.move(1e9); return true; }
+    const it = this.detail.item;
+    if (!it) return false;
+    if (k === 'Delete') { this.detail.recycle(); return true; }
+    if (k === 'Enter' || k === 't' || k === 'T') { emit('view-image', it.path); return true; }
+    if (k === 'c' || k === 'C') { emit('open-compare', it.id); return true; }
+    if (k === 'r' || k === 'R') { api.call('item:requeue', it.id).then(() => toast('Looking up again')); return true; }
+    if (k === 'g' || k === 'G') { emit('search-in-tab', { engine: 'google', path: it.path, itemId: it.id }); return true; }
+    if (k === 'y' || k === 'Y') { emit('search-in-tab', { engine: 'yandex', path: it.path, itemId: it.id }); return true; }
+    if (k === 'e' || k === 'E') { if (this.dock !== 'closed') { emit('dock', this.dock === 'small' ? 'expanded' : 'small'); return true; } }
+    return false;
   }
 
   // After sorting, jump to the next file in the list (sorted files drop out of "To do").
@@ -262,7 +272,6 @@ export class LookupsView {
       const it = state.items.get(id);
       const stillListed = it && this.statusOk(it, this.filter);
       if (!stillListed && next) this.select(next.id);
-      this.grid.focus();
     }, 450);
   }
 
@@ -332,5 +341,5 @@ export class LookupsView {
     }
   }
 
-  onShow() { setTimeout(() => this.grid.focus(), 0); this.layout(); }
+  onShow() { this.layout(); }
 }

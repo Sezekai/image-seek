@@ -104,6 +104,10 @@ const P = {
   dock: '<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M14 4v16"/><path d="m8 10 2 2-2 2"/>',
   saveas: '<path d="M5 3h11l3 3v15H5z"/><path d="M8 3v5h7V3M8 21v-7h8v7"/>',
   chevR: '<path d="m9 6 6 6-6 6"/>',
+  closeall: '<rect x="3" y="5" width="18" height="14" rx="2"/><path d="m9 9 6 6M15 9l-6 6"/>',
+  keyboard: '<rect x="2" y="6" width="20" height="12" rx="2"/><path d="M6 10h.01M10 10h.01M14 10h.01M18 10h.01M8 14h8"/>',
+  cards: '<rect x="3" y="3" width="7" height="9" rx="1.5"/><rect x="14" y="3" width="7" height="9" rx="1.5"/><rect x="3" y="15" width="7" height="6" rx="1.5"/><rect x="14" y="15" width="7" height="6" rx="1.5"/>',
+  list: '<path d="M9 6h11M9 12h11M9 18h11"/><rect x="3" y="4.5" width="3" height="3" rx=".5"/><rect x="3" y="10.5" width="3" height="3" rx=".5"/><rect x="3" y="16.5" width="3" height="3" rx=".5"/>',
   chevD: '<path d="m6 9 6 6 6-6"/>',
 };
 export function icon(name, cls) {
@@ -194,7 +198,7 @@ export function modal(title, body, buttons) {
       }
     };
     const ov = h('div', { class: 'overlay', onmousedown: (e) => { if (e.target === ov) close(null); } },
-      h('div', { class: 'modal' },
+      h('div', { class: 'modal' + (body && body.classList && body.classList.contains('keys-cols') ? ' wide' : '') },
         h('div', { class: 'mh' }, title),
         h('div', { class: 'mb' }, body),
         h('div', { class: 'mf' }, buttons.map((b) => btn(b.label, { cls: b.primary ? 'primary' : '', onclick: () => close(b.value ? b.value() : b.label) })))));
@@ -228,8 +232,8 @@ export function popupMenu(x, y, items) {
     : h('div', { class: 'mi', onclick: () => { m.remove(); it.run(); } }, it.img ? h('img', { src: it.img }) : null, h('span', { class: 'ell' }, it.label))));
   document.body.appendChild(m);
   const r = m.getBoundingClientRect();
-  m.style.left = Math.min(x, innerWidth - r.width - 8) + 'px';
-  m.style.top = Math.min(y, innerHeight - r.height - 8) + 'px';
+  m.style.left = Math.max(8, Math.min(x, innerWidth - r.width - 8)) + 'px';
+  m.style.top = Math.max(8, Math.min(y, innerHeight - r.height - 8)) + 'px';
   setTimeout(() => document.addEventListener('mousedown', function off(e) { if (!m.contains(e.target)) { m.remove(); document.removeEventListener('mousedown', off); } }), 0);
   return m;
 }
@@ -253,11 +257,23 @@ document.addEventListener('mouseover', (e) => {
 });
 
 // ---------- image viewer ----------
-export function viewImage(src) {
-  const v = h('div', { class: 'viewer', onclick: () => v.remove() }, h('img', { src }));
+// Full-window image viewer. nav(dir) can return the next / previous image to show (← →).
+export function viewImage(src, opts = {}) {
+  const img = h('img', { src });
+  const cap = h('div', { class: 'viewer-cap' }, opts.caption || '');
+  const close = () => { v.remove(); document.removeEventListener('keydown', k, true); };
+  const v = h('div', { class: 'viewer', onclick: close }, img, cap);
   document.body.appendChild(v);
-  const k = (e) => { if (e.key === 'Escape') { v.remove(); document.removeEventListener('keydown', k); } };
-  document.addEventListener('keydown', k);
+  const k = (e) => {
+    const key = e.key;
+    if (key === 'Escape' || key === 'Enter' || key === 't' || key === 'T') { e.preventDefault(); e.stopPropagation(); close(); return; }
+    if ((key === 'ArrowLeft' || key === 'ArrowRight') && opts.nav) {
+      e.preventDefault(); e.stopPropagation();
+      const next = opts.nav(key === 'ArrowLeft' ? -1 : 1);
+      if (next) { img.src = next.src; cap.textContent = next.caption || ''; }
+    }
+  };
+  document.addEventListener('keydown', k, true);
 }
 
 // ---------- resizable side panels ----------

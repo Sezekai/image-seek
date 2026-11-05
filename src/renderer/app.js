@@ -1,4 +1,5 @@
-import { api, state, h, icon, clear, on, emit, toast, viewImage, fileUrl, fmtTime, prepForUpload, dHash } from './core.js';
+import { api, state, h, icon, clear, on, emit, toast, viewImage, fileUrl, fmtTime, prepForUpload, dHash, modal } from './core.js';
+import { activeSortPanel, toggleNsfw, toggleVery } from './sortpanel.js';
 import { LookupsView } from './views/lookups.js';
 import { Browser, BrowserView } from './views/browser.js';
 import { DownloadsView } from './views/downloads.js';
@@ -100,7 +101,7 @@ function placeBrowser() {
   if (!browser) return;
   const lk = views.lookups.inst;
   if (state.view === 'browser') browser.show(views.browser.inst.slot, 'full');
-  else if (state.view === 'lookups' && lk.dock !== 'closed') browser.show(lk.slot, lk.dock);
+  else if (state.view === 'lookups' && lk.dock !== 'closed') browser.show(lk.slot, lk.dock, { histHost: lk.histHost });
   else browser.hide();
 }
 
@@ -112,12 +113,21 @@ function setDock(d) {
   requestAnimationFrame(placeBrowser);
 }
 
-// Links opened from Lookups open in a new tab in the docked browser; from anywhere else, in the Browser tab.
-function openUrl({ url, itemId }) {
+// Links opened from Lookups go to the docked browser; from anywhere else, to the Browser tab.
+// Match links re-use that file's tab (Ctrl+click / middle-click = new tab).
+function openUrl({ url, itemId, newTab, fromLinks }) {
   if (state.view === 'lookups') { if (views.lookups.inst.dock === 'closed') setDock(state.lastDock || 'small'); }
   else if (state.view !== 'browser') showView('browser');
-  browser.open(url, { itemId, active: true });
+  if (fromLinks) browser.openLink(url, itemId, newTab);
+  else browser.open(url, { itemId, active: true });
 }
+
+// Closing the last tab (or "close all") closes the browser.
+function browserClosed() {
+  if (state.view === 'browser') showView('lookups');
+  if (views.lookups.inst.dock !== 'closed') setDock('closed');
+}
+
 function searchInTab(o) {
   if (state.view === 'lookups') { if (views.lookups.inst.dock === 'closed') setDock(state.lastDock || 'small'); }
   else if (state.view !== 'browser') showView('browser');
@@ -145,7 +155,7 @@ function buildLog(initial) {
   const last = h('span', { class: 'last' });
   const lines = h('div', { class: 'lines' });
   const caretHost = h('span', null, icon(state.settings.logOpen ? 'down' : 'up'));
-  const head = h('div', { class: 'bar', onclick: () => {
+  const head = h('div', { class: 'bar', title: 'Activity log (L)', onclick: () => {
     bar.classList.toggle('open');
     const open = bar.classList.contains('open');
     clear(caretHost).appendChild(icon(open ? 'down' : 'up'));
@@ -165,6 +175,84 @@ function buildLog(initial) {
   };
   initial.forEach(add);
   api.on('log', add);
+}
+
+// ---------- keyboard ----------
+function typing() {
+  const t = document.activeElement;
+  return t && ((t.tagName === 'INPUT' && !['checkbox', 'radio', 'range', 'button'].includes(t.type)) || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT' || t.isContentEditable);
+}
+
+function focusSort() {
+  const p = activeSortPanel();
+  if (p) p.api.focus();
+  else toast('Nothing to sort on this screen', 'warn', 2000);
+}
+
+async function toggleFullscreen() { await api.call('win:fullscreen'); }
+
+function toggleLog() { document.querySelector('#logbar .bar').click(); }
+
+// Keys that work everywhere in the app (the browser's own keys are handled by the browser).
+function appKey(e) {
+  if (e.defaultPrevented) return;
+  if (keysOpen && (e.key === 'k' || e.key === 'K' || e.key === '?')) { e.preventDefault(); document.querySelector('.overlay')?.remove(); keysOpen = false; return; }
+  if (document.querySelector('.overlay')) return; // a dialog is open
+  if (e.key === 'F11') { e.preventDefault(); toggleFullscreen(); return; }
+  if (e.ctrlKey || e.metaKey) {
+    if (typing()) return;
+    if (e.key.toLowerCase() === 'z' && !e.shiftKey) { e.preventDefault(); undoLast(); }
+    return;
+  }
+  if (e.altKey) return;
+  if (typing()) { if (e.key === 'Escape') document.activeElement.blur(); return; }
+  if (document.querySelector('.viewer')) return; // the image viewer has its own keys
+  const k = e.key;
+  const lower = k.toLowerCase();
+  const done = () => { e.preventDefault(); e.stopPropagation(); };
+  if (k === '/') { done(); focusSort(); return; }
+  if (lower === 'k' || k === '?') { done(); showShortcuts(); return; }
+  if (lower === 'f') { done(); toggleFullscreen(); return; }
+  if (lower === 'n') { done(); toggleNsfw(); return; }
+  if (lower === 'v') { done(); toggleVery(); return; }
+  if (lower === 'l') { done(); toggleLog(); return; }
+  if (lower === 'h') { done(); document.body.classList.toggle('bars-hidden'); setTimeout(() => window.dispatchEvent(new Event('resize')), 30); return; }
+  if (lower === 'm') { done(); document.body.classList.toggle('no-rail'); setTimeout(() => window.dispatchEvent(new Event('resize')), 30); return; }
+  if (lower === 'b') {
+    done();
+    if (state.view === 'lookups') setDock(views.lookups.inst.dock === 'closed' ? (state.lastDock || 'small') : 'closed');
+    else showView(state.view === 'browser' ? 'lookups' : 'browser');
+    return;
+  }
+  if (/^[1-9]$/.test(k)) { const p = activeSortPanel(); if (p && p.api.sortNth(+k - 1)) done(); return; }
+  // screen numbers with Shift+1…7 would clash with sorting, so switching screens uses the rail / these:
+  if (k === 'Escape' && document.body.classList.contains('bars-hidden')) { done(); document.body.classList.remove('bars-hidden'); return; }
+  const inst = views[state.view] && views[state.view].inst;
+  if (inst && inst.handleKey && inst.handleKey(e)) done();
+}
+
+function undoLast() {
+  const last = state.sortLog.slice().reverse().find((l) => !l.undone && l.kind !== 'gone' && l.kind !== 'moved' && !l.missingAt);
+  if (!last) { toast('Nothing to undo', 'warn', 2000); return; }
+  api.call('sort:undo', last.id).then(() => toast('Undid: ' + last.to.split(/[\\/]/).pop())).catch((x) => toast(x.message, 'error'));
+}
+
+let keysOpen = false;
+async function showShortcuts() {
+  if (keysOpen) { document.querySelector('.overlay')?.remove(); keysOpen = false; return; }
+  const sec = (title, rows) => [h('tr', null, h('th', { colspan: '2' }, title)), ...rows.map(([k, d]) => h('tr', null, h('td', null, ...String(k).split(/(\s+|\+|\/)/).filter((x) => x.trim()).map((x) => (x === '+' || x === '/' || x === 'or' ? h('span', { class: 'dim' }, ` ${x} `) : h('kbd', null, x)))), h('td', { class: 'muted' }, d)))];
+  const col1 = h('table', { class: 'keys-table' },
+    ...sec('Anywhere', [['/', 'Jump to the sort box'], ['N', 'Toggle the NSFW subfolder'], ['V', 'Toggle the Very subfolder (inside NSFW)'], ['1 … 9', 'Sort into the 1st … 9th folder shown'], ['Ctrl + Z', 'Undo the last sort'], ['K or ?', 'This list'], ['F or F11', 'Full screen'], ['H', 'Hide / show the menus and bars'], ['M', 'Hide / show the side menu'], ['L', 'Open / close the activity log'], ['B', 'Show / hide the browser'], ['Esc', 'Leave a text box / close the viewer']]),
+    ...sec('In the sort box', [['Type', 'Filter your folders'], ['↑ ↓', 'Move the highlight'], ['Enter', 'Sort into the highlighted folder — a new name creates the folder first'], ['Tab', 'Fill in the highlighted name (then add /Sub for a subfolder)'], ['Alt + N  /  Alt + V', 'Toggle NSFW / Very while typing'], ['Esc', 'Leave the box']]),
+    ...sec('Lookups', [['← → ↑ ↓', 'Move between files'], ['Home / End', 'First / last file'], ['Enter or T', 'Open the viewer'], ['C', 'Compare the downloaded versions'], ['G  /  Y', 'Search with Google Lens / Yandex in a new tab'], ['R', 'Look the file up again'], ['E', 'Expand / shrink the browser'], ['Delete', 'Send the original to the Recycle Bin'], ['Click a match link', 'Open it in that file\'s tab'], ['Ctrl + click or middle-click', 'Open it in a new tab']]));
+  const col2 = h('table', { class: 'keys-table' },
+    ...sec('Browser (small, expanded or full)', [['Ctrl + T', 'New tab'], ['Ctrl + W', 'Close the tab (the last one closes the browser)'], ['Ctrl + Shift + W', 'Close all tabs and the browser'], ['Ctrl + Shift + T', 'Reopen the last closed tab'], ['Ctrl + Tab', 'Next tab'], ['Ctrl + Shift + Tab', 'Previous tab'], ['Ctrl + 1 … 8  /  Ctrl + 9', 'Go to that tab / the last tab'], ['Alt + ←  /  Alt + →', 'Back / forward (mouse buttons too)'], ['Ctrl + L', 'Address bar'], ['Ctrl + H', 'History'], ['F5 or Ctrl + R', 'Reload'], ['Middle-click a tab', 'Close it'], ['Right-click a tab', 'Close others / left / right, duplicate, link…']]),
+    ...sec('Right-click an image in the browser (then press)', [['S', 'Save to the linked file (or unlinked)'], ['O', 'Save the original size'], ['U', 'Save as unlinked'], ['V', 'Save as… — choose any folder'], ['T', 'Open the image in a new tab'], ['G', 'Search it with Google Lens'], ['C  /  A', 'Copy the image / its address'], ['D  /  K', 'Download a linked image / save the link as…']]),
+    ...sec('Compare', [['Hold Space', 'Show the original in every pane'], ['Mouse wheel', 'Zoom (all panes together)'], ['Drag', 'Move around'], ['Double-click', 'Fit']]),
+    ...sec('Viewer', [['← →', 'Previous / next file'], ['Esc, T or Enter', 'Close']]));
+  keysOpen = true;
+  await modal('Keyboard shortcuts', h('div', { class: 'keys-cols' }, col1, col2), [{ label: 'Close', primary: true, value: () => null }]);
+  keysOpen = false;
 }
 
 async function init() {
@@ -192,6 +280,7 @@ async function init() {
     viewsEl.appendChild(el);
     views[v.id] = { el };
   }
+  rail.insertBefore(h('button', { class: 'rb', 'data-tip': 'Keyboard shortcuts (K)', onclick: () => showShortcuts() }, icon('keyboard')), railBtns.settings);
   browser = new Browser();
   for (const v of VIEWS) views[v.id].inst = new v.cls(views[v.id].el);
   state.lastDock = data.settings.dock && data.settings.dock !== 'closed' ? data.settings.dock : 'small';
@@ -199,25 +288,29 @@ async function init() {
   on('open-url', openUrl);
   on('search-in-tab', searchInTab);
   document.addEventListener('keydown', (e) => browser.key(e), true);
+  document.addEventListener('keydown', appKey);
+  on('browser-closed', browserClosed);
+  on('fullscreen', toggleFullscreen);
+  api.on('app:hotkey', (k) => { if (k === '/') focusSort(); });
   buildLog(data.log);
 
   on('show-view', showView);
-  on('view-image', (p) => viewImage(fileUrl(p)));
+  on('view-image', (p) => {
+    // In Lookups, ← → step through the files in the grid (and select them).
+    const lk = views.lookups.inst;
+    const nav = state.view === 'lookups' ? (dir) => {
+      lk.move(dir);
+      const it = lk.detail.id && state.items.get(lk.detail.id);
+      return it ? { src: fileUrl(it.path), caption: it.name } : null;
+    } : null;
+    const cur = [...state.items.values()].find((x) => x.path === p);
+    viewImage(fileUrl(p), { nav, caption: cur ? cur.name : '' });
+  });
   on('select-item', (id) => views.lookups.inst.select(id));
   // Browser shortcuts pressed while a web page has focus are forwarded from the main process.
   api.on('browser:shortcut', (k) => browser.shortcut(k));
   api.on('queue:status', (q) => { state.queue = q; renderStatus(); emit('queue'); });
   api.on('settings:changed', (s) => { state.settings = s; emit('settings', s); });
-
-  // Ctrl+Z: undo the last sort from anywhere.
-  document.addEventListener('keydown', async (e) => {
-    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z' && !/INPUT|TEXTAREA/.test(document.activeElement.tagName)) {
-      const last = state.sortLog.slice().reverse().find((l) => !l.undone && l.kind !== 'gone' && l.kind !== 'moved' && !l.missingAt);
-      if (!last) return;
-      e.preventDefault();
-      api.call('sort:undo', last.id).then(() => toast('Undid: ' + last.to.split(/[\\/]/).pop())).catch((x) => toast(x.message, 'error'));
-    }
-  });
 
   // Drop files/folders from Explorer onto the window to add them.
   document.addEventListener('dragover', (e) => { if (e.dataTransfer && [...e.dataTransfer.types].includes('Files')) e.preventDefault(); });

@@ -6,6 +6,7 @@
 // places never reloads the pages. Each tab can be linked to a looked-up file; downloads from
 // a linked tab are saved into that file's folder.
 import { api, state, h, icon, btn, clear, thumbUrl, toast, on, emit, popupMenu, hostOf } from '../core.js';
+import { HistoryList } from './historylist.js';
 
 const DISCARD_AFTER = 15 * 60 * 1000;
 let nextId = 1;
@@ -14,6 +15,9 @@ export class Browser {
   constructor() {
     this.tabs = [];
     this.active = null;
+    this.closed = []; // recently closed tabs, for Ctrl+Shift+T
+    this.linkTabs = new Map(); // item id -> tab opened from that file's match links (reused)
+    this.histOpen = false;
     this.slot = null;
     this.place = null; // 'small' | 'expanded' | 'full' | null (hidden)
     this.build();
@@ -31,7 +35,17 @@ export class Browser {
   }
 
   build() {
-    this.tabsEl = h('div', { class: 'tabs' });
+    // Tab bar: tabs shrink to a minimum width, then scroll with the arrow buttons (or the
+    // mouse wheel); the ▾ button lists every tab.
+    this.tabsEl = h('div', { class: 'tabstrip' });
+    this.scrollL = h('button', { class: 'tabarrow hidden', title: 'Scroll tabs left', onclick: () => this.scrollTabs(-1) }, icon('back'));
+    this.scrollR = h('button', { class: 'tabarrow hidden', title: 'Scroll tabs right', onclick: () => this.scrollTabs(1) }, icon('fwd'));
+    this.newTabBtn = h('button', { class: 'newtab', title: 'New tab (Ctrl+T)', onclick: () => this.open(state.settings.homepage, { active: true, itemId: this.boundItemForNew() }) }, icon('plus'));
+    this.listBtn = h('button', { class: 'newtab', title: 'List all tabs', onclick: (e) => this.listTabs(e) }, icon('chevD'));
+    this.tabBar = h('div', { class: 'tabs' }, this.scrollL, this.tabsEl, this.scrollR, this.newTabBtn, h('div', { class: 'grow' }), this.listBtn);
+    this.tabsEl.addEventListener('wheel', (e) => { e.preventDefault(); this.tabsEl.scrollLeft += (Math.abs(e.deltaY) > Math.abs(e.deltaX) ? e.deltaY : e.deltaX); this.updateArrows(); }, { passive: false });
+    this.tabsEl.addEventListener('scroll', () => this.updateArrows());
+    new ResizeObserver(() => requestAnimationFrame(() => this.updateArrows())).observe(this.tabsEl);
     this.addrInput = h('input', { class: 'input', placeholder: 'Search Google or type a URL', spellcheck: 'false' });
     this.suggestEl = h('div', { class: 'suggest hidden' });
     this.backBtn = btn('', { icon: 'back', cls: 'ghost', title: 'Back (Alt+← or mouse back button)', onclick: () => this.go('back') });
@@ -73,7 +87,7 @@ export class Browser {
       h('div', { class: 'vsep' }),
       this.darkBtn, this.actions,
       btn('', { icon: 'store', cls: 'ghost', title: 'Chrome Web Store (install extensions)', onclick: () => this.open('https://chromewebstore.google.com/', { active: true }) }),
-      btn('', { icon: 'history', cls: 'ghost', title: 'History', onclick: () => emit('show-view', 'history') }),
+      (this.histBtn = btn('', { icon: 'history', cls: 'ghost', title: 'History (Ctrl+H)', onclick: () => this.toggleHistory() })),
       this.dlEl,
       h('div', { class: 'vsep' }),
       this.placeBtns);
@@ -82,9 +96,13 @@ export class Browser {
     this.blank = h('div', { class: 'blank' }, h('div', { class: 'empty' }, icon('globe'), h('div', null, 'No tabs open'),
       btn('New tab', { icon: 'plus', cls: 'primary', onclick: () => this.open(state.settings.homepage, { active: true, itemId: this.boundItemForNew() }) })));
     this.views.appendChild(this.blank);
-    this.el = h('div', { class: 'browser-layer off' }, this.tabsEl, this.toolbar, this.bindEl, this.views);
+    // History side panel (in the small view it covers the file grid instead).
+    this.history = new HistoryList({ compact: true, onOpen: (url, newTab) => this.openFromHistory(url, newTab), onClose: () => this.toggleHistory(false) });
+    this.histSide = h('div', { class: 'histside hidden' });
+    this.body = h('div', { class: 'bbody' }, this.histSide, this.views);
+    this.el = h('div', { class: 'browser-layer off' }, this.tabBar, this.toolbar, this.bindEl, this.body);
     document.body.appendChild(this.el);
-    new ResizeObserver(() => this.el.classList.toggle('narrow', this.el.clientWidth < 1000)).observe(this.el);
+    new ResizeObserver(() => requestAnimationFrame(() => this.el.classList.toggle('narrow', this.el.clientWidth < 1000))).observe(this.el);
 
     this.addrInput.addEventListener('keydown', (e) => this.addrKey(e));
     this.addrInput.addEventListener('input', () => this.suggest());
@@ -96,8 +114,9 @@ export class Browser {
   }
 
   // ---------- placement ----------
-  show(slot, place) {
+  show(slot, place, opts = {}) {
     this.slot = slot;
+    this.histSmallHost = opts.histHost || null;
     const changed = this.place !== place;
     this.place = place;
     this.el.classList.remove('off');
@@ -106,6 +125,8 @@ export class Browser {
     if (changed) this.renderPlace();
     if (!this.tabs.length) this.open(state.settings.homepage, { active: true, itemId: this.boundItemForNew() });
     this.renderBind();
+    this.placeHistory();
+    requestAnimationFrame(() => this.revealActive());
   }
 
   hide() {
@@ -113,6 +134,29 @@ export class Browser {
     this.slot = null;
     this.el.classList.add('off');
     this.suggestEl.classList.add('hidden');
+    this.placeHistory();
+  }
+
+  // ---------- history panel ----------
+  toggleHistory(open) {
+    this.histOpen = open === undefined ? !this.histOpen : open;
+    this.histBtn.classList.toggle('on', this.histOpen);
+    this.placeHistory();
+    if (this.histOpen) { this.history.render(); this.history.focus(); }
+  }
+
+  placeHistory() {
+    const small = this.place === 'small' && this.histSmallHost;
+    const show = this.histOpen && !!this.place;
+    if (this.histSmallHost) this.histSmallHost.classList.toggle('hidden', !(show && small));
+    this.histSide.classList.toggle('hidden', !(show && !small));
+    const host = small ? this.histSmallHost : this.histSide;
+    if (show && this.history.el.parentNode !== host) host.appendChild(this.history.el);
+  }
+
+  openFromHistory(url, newTab) {
+    if (newTab || !this.active) this.open(url, { active: !newTab || !this.active, itemId: this.boundItemForNew() });
+    else this.navigateTab(this.active, url);
   }
 
   get visible() { return !!this.place; }
@@ -129,18 +173,21 @@ export class Browser {
   renderPlace() {
     clear(this.placeBtns);
     const b = (ic, tip, fn) => btn('', { icon: ic, cls: 'ghost', title: tip, onclick: fn });
+    const closeAll = b('closeall', 'Close all tabs and the browser (Ctrl+Shift+W)', () => this.closeAll());
     if (this.place === 'small') {
       this.placeBtns.append(
-        b('expand', 'Expand over the file grid', () => emit('dock', 'expanded')),
+        b('expand', 'Expand over the file grid (E)', () => emit('dock', 'expanded')),
         b('maximize', 'Open in the Browser tab', () => emit('show-view', 'browser')),
-        b('x', 'Close the browser panel (tabs stay open)', () => emit('dock', 'closed')));
+        b('x', 'Close the browser panel — tabs stay open (B)', () => emit('dock', 'closed')),
+        closeAll);
     } else if (this.place === 'expanded') {
       this.placeBtns.append(
-        b('shrink', 'Show the file grid again', () => emit('dock', 'small')),
+        b('shrink', 'Show the file grid again (E)', () => emit('dock', 'small')),
         b('maximize', 'Open in the Browser tab', () => emit('show-view', 'browser')),
-        b('x', 'Close the browser panel (tabs stay open)', () => emit('dock', 'closed')));
+        b('x', 'Close the browser panel — tabs stay open (B)', () => emit('dock', 'closed')),
+        closeAll);
     } else if (this.place === 'full') {
-      this.placeBtns.append(b('dock', 'Show in Lookups next to the files', () => { emit('dock', state.lastDock || 'small'); emit('show-view', 'lookups'); }));
+      this.placeBtns.append(b('dock', 'Show in Lookups next to the files', () => { emit('dock', state.lastDock || 'small'); emit('show-view', 'lookups'); }), closeAll);
     }
   }
 
@@ -207,6 +254,23 @@ export class Browser {
     this.views.appendChild(wv);
   }
 
+  navigateTab(tab, url) {
+    tab.url = url;
+    if (tab.discarded) { this.activate(tab); return; }
+    if (tab.wv && tab.wcId) tab.wv.loadURL(url).catch(() => {});
+    this.activate(tab);
+  }
+
+  // A match link from the info panel: re-uses the tab opened from that file's links,
+  // or opens a new one (always new with Ctrl+click / middle-click — in the background).
+  openLink(url, itemId, newTab) {
+    const prev = itemId && this.linkTabs.get(itemId);
+    if (!newTab && prev && this.tabs.includes(prev)) { this.navigateTab(prev, url); return prev; }
+    const t = this.open(url, { itemId, active: !newTab || !this.active });
+    if (itemId && (!prev || !this.tabs.includes(prev))) this.linkTabs.set(itemId, t);
+    return t;
+  }
+
   activate(tab) {
     if (tab.discarded) this.restore(tab);
     this.active = tab;
@@ -219,13 +283,17 @@ export class Browser {
     this.renderBind();
     this.renderNav();
     this.renderSave();
+    emit('browser-tab');
   }
 
-  close(tab) {
+  // Closing the last tab closes the browser too.
+  close(tab, { keepBrowser } = {}) {
     const i = this.tabs.indexOf(tab);
     if (i < 0) return;
+    if (tab.url && tab.url !== 'about:blank') { this.closed.push({ url: tab.url, itemId: tab.itemId }); if (this.closed.length > 25) this.closed.shift(); }
     if (tab.wv) tab.wv.remove();
     this.tabs.splice(i, 1);
+    for (const [k, t] of this.linkTabs) if (t === tab) this.linkTabs.delete(k);
     if (this.active === tab) {
       this.active = null;
       const next = this.tabs[i] || this.tabs[i - 1];
@@ -233,6 +301,73 @@ export class Browser {
       else { this.blank.classList.remove('hidden'); this.addrInput.value = ''; this.renderBind(); this.renderSave(); }
     }
     this.renderTabs();
+    if (!this.tabs.length && !keepBrowser) emit('browser-closed');
+  }
+
+  closeMany(list) {
+    for (const t of [...list]) this.close(t, { keepBrowser: true });
+    if (!this.tabs.length) emit('browser-closed');
+  }
+
+  closeAll() { this.closeMany(this.tabs); this.toggleHistory(false); }
+
+  reopen() {
+    const c = this.closed.pop();
+    if (c) this.open(c.url, { itemId: c.itemId, active: true });
+  }
+
+  tabMenu(e, t) {
+    e.preventDefault();
+    const i = this.tabs.indexOf(t);
+    const sel = state.selectedItem && state.items.get(state.selectedItem);
+    const items = [
+      { label: 'New tab', run: () => this.open(state.settings.homepage, { active: true, itemId: this.boundItemForNew() }) },
+      { label: 'Reload', run: () => { if (t.wv && t.wcId) t.wv.reload(); else this.activate(t); } },
+      { label: 'Duplicate tab', run: () => this.open(t.url, { itemId: t.itemId, active: true }) },
+      { label: 'Copy address', run: () => navigator.clipboard.writeText(t.url || '') },
+      '-',
+      sel && sel.id !== t.itemId ? { label: `Link to "${sel.name.length > 28 ? sel.name.slice(0, 27) + '…' : sel.name}"`, run: () => { this.activate(t); this.setBind(sel.id); } } : null,
+      t.itemId ? { label: 'Unlink tab', run: () => { this.activate(t); this.setBind(null); } } : null,
+      '-',
+      { label: 'Close tab', run: () => this.close(t) },
+      i > 0 ? { label: `Close tabs to the left (${i})`, run: () => this.closeMany(this.tabs.slice(0, i)) } : null,
+      i < this.tabs.length - 1 ? { label: `Close tabs to the right (${this.tabs.length - 1 - i})`, run: () => this.closeMany(this.tabs.slice(i + 1)) } : null,
+      this.tabs.length > 1 ? { label: `Close other tabs (${this.tabs.length - 1})`, run: () => this.closeMany(this.tabs.filter((x) => x !== t)) } : null,
+      t.itemId && this.tabs.filter((x) => x.itemId === t.itemId).length > 1 ? { label: 'Close all tabs linked to this file', run: () => this.closeMany(this.tabs.filter((x) => x.itemId === t.itemId)) } : null,
+      { label: 'Close all tabs and the browser', run: () => this.closeAll() },
+      this.closed.length ? '-' : null,
+      this.closed.length ? { label: 'Reopen closed tab (Ctrl+Shift+T)', run: () => this.reopen() } : null,
+    ].filter(Boolean);
+    while (items[0] === '-') items.shift();
+    popupMenu(e.clientX, e.clientY, items.filter((x, k) => !(x === '-' && (items[k + 1] === '-' || k === items.length - 1))));
+  }
+
+  listTabs(e) {
+    const r = e.currentTarget.getBoundingClientRect();
+    popupMenu(r.right - 300, r.bottom + 4, this.tabs.map((t) => {
+      const it = t.itemId ? state.items.get(t.itemId) : null;
+      return { label: (t === this.active ? '● ' : '') + (t.title || hostOf(t.url) || 'New tab'), img: it ? thumbUrl(it.path, 64) : t.favicon || null, run: () => this.activate(t) };
+    }));
+  }
+
+  scrollTabs(dir) {
+    this.tabsEl.scrollBy({ left: dir * Math.max(120, this.tabsEl.clientWidth * 0.6), behavior: 'smooth' });
+    setTimeout(() => this.updateArrows(), 350);
+  }
+
+  updateArrows() {
+    const el = this.tabsEl;
+    const over = el.scrollWidth > el.clientWidth + 1;
+    this.scrollL.classList.toggle('hidden', !over);
+    this.scrollR.classList.toggle('hidden', !over);
+    this.scrollL.disabled = el.scrollLeft <= 0;
+    this.scrollR.disabled = el.scrollLeft + el.clientWidth >= el.scrollWidth - 1;
+  }
+
+  revealActive() {
+    const el = this.active && this.tabsEl.querySelector(`[data-tab="${this.active.id}"]`);
+    if (el) el.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+    this.updateArrows();
   }
 
   // Free memory from tabs you haven't looked at in a while; they reload when selected.
@@ -255,17 +390,22 @@ export class Browser {
   }
 
   renderTabs() {
+    const keep = this.tabsEl.scrollLeft;
     clear(this.tabsEl);
     for (const t of this.tabs) this.tabsEl.appendChild(this.tabEl(t));
-    this.tabsEl.appendChild(h('button', { class: 'newtab', title: 'New tab (Ctrl+T)', onclick: () => this.open(state.settings.homepage, { active: true, itemId: this.boundItemForNew() }) }, icon('plus')));
+    this.tabsEl.scrollLeft = keep;
+    requestAnimationFrame(() => this.revealActive());
   }
 
   tabEl(t) {
     const it = t.itemId ? state.items.get(t.itemId) : null;
     const el = h('div', {
-      class: 'tab' + (t === this.active ? ' on' : ''), title: (it ? `Linked to ${it.name}\n` : '') + (t.title || t.url),
+      class: 'tab' + (t === this.active ? ' on' : ''), title: (it ? `Linked to ${it.name}\n` : '') + (t.title || t.url) + '\nMiddle-click to close · right-click for more',
       onclick: () => this.activate(t),
-      onauxclick: (e) => { if (e.button === 1) this.close(t); },
+      // Middle-click closes (mousedown is cancelled so it doesn't start auto-scroll).
+      onmousedown: (e) => { if (e.button === 1) e.preventDefault(); },
+      onmouseup: (e) => { if (e.button === 1) { e.preventDefault(); this.close(t); } },
+      oncontextmenu: (e) => this.tabMenu(e, t),
     },
     t.loading ? h('span', { class: 'spin' }) : it ? h('img', { class: 'bound', src: thumbUrl(it.path, 64) }) : t.favicon ? h('img', { class: 'fav', src: t.favicon, onerror: (e) => e.target.remove() }) : icon('globe'),
     h('span', { class: 't' }, t.title || hostOf(t.url) || 'New tab'),
@@ -455,33 +595,47 @@ export class Browser {
 
   // Keyboard / mouse shortcuts (from the app window or forwarded from web pages).
   shortcut(k) {
+    if (k === 'fullscreen') { emit('fullscreen'); return; }
     if (!this.visible) return;
     if (k === 'newtab') { this.open(state.settings.homepage, { active: true, itemId: this.boundItemForNew() }); setTimeout(() => this.addrInput.focus(), 50); }
-    else if (k === 'close') { if (this.active) this.close(this.active); }
-    else if (k === 'address') this.addrInput.focus();
+    else if (k === 'close') { if (this.active) this.close(this.active); else emit('browser-closed'); }
+    else if (k === 'closeall') this.closeAll();
+    else if (k === 'reopen') this.reopen();
+    else if (k === 'address') { this.addrInput.focus(); this.addrInput.select(); }
+    else if (k === 'history') this.toggleHistory();
     else if (k === 'next' || k === 'prev') {
       if (this.tabs.length > 1) { const i = this.tabs.indexOf(this.active); this.activate(this.tabs[(i + (k === 'prev' ? -1 : 1) + this.tabs.length) % this.tabs.length]); }
+    } else if (/^tab[1-9]$/.test(k)) {
+      const n = +k.slice(3);
+      const t = n === 9 ? this.tabs[this.tabs.length - 1] : this.tabs[n - 1];
+      if (t) this.activate(t);
     } else if (k === 'reload') this.go('reload');
     else if (k === 'back') this.go('back');
     else if (k === 'forward') this.go('forward');
   }
 
-  // Shortcuts pressed while the app UI (not a web page) has focus.
+  // Shortcuts pressed while the app itself (not a web page) has focus. They work whenever the
+  // browser is showing — small, expanded or in the Browser tab.
   key(e) {
     if (!this.visible) return;
-    const inBrowser = this.el.contains(document.activeElement) || state.view === 'browser';
-    if (!inBrowser) return;
     const ctrl = e.ctrlKey || e.metaKey;
     const k = e.key.toLowerCase();
     let cmd = null;
-    if (ctrl && k === 't') cmd = 'newtab';
+    if (ctrl && e.shiftKey && k === 'w') cmd = 'closeall';
+    else if (ctrl && e.shiftKey && k === 't') cmd = 'reopen';
+    else if (ctrl && k === 't') cmd = 'newtab';
     else if (ctrl && k === 'w') cmd = 'close';
     else if (ctrl && k === 'l') cmd = 'address';
+    else if (ctrl && k === 'h') cmd = 'history';
+    else if (ctrl && k === 'r') cmd = 'reload';
     else if (ctrl && e.key === 'Tab') cmd = e.shiftKey ? 'prev' : 'next';
+    else if (ctrl && e.key === 'PageDown') cmd = 'next';
+    else if (ctrl && e.key === 'PageUp') cmd = 'prev';
+    else if (ctrl && !e.shiftKey && /^[1-9]$/.test(e.key)) cmd = 'tab' + e.key;
     else if (e.key === 'F5') cmd = 'reload';
     else if (e.altKey && e.key === 'ArrowLeft') cmd = 'back';
     else if (e.altKey && e.key === 'ArrowRight') cmd = 'forward';
-    if (cmd) { e.preventDefault(); this.shortcut(cmd); }
+    if (cmd) { e.preventDefault(); e.stopPropagation(); this.shortcut(cmd); }
   }
 }
 

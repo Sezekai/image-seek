@@ -174,11 +174,19 @@ class BrowserManager {
       const ctrl = input.control || input.meta;
       const key = (input.key || '').toLowerCase();
       let k = null;
-      if (ctrl && key === 't') k = 'newtab';
+      if (ctrl && input.shift && key === 'w') k = 'closeall';
+      else if (ctrl && input.shift && key === 't') k = 'reopen';
+      else if (ctrl && key === 't') k = 'newtab';
       else if (ctrl && key === 'w') k = 'close';
       else if (ctrl && key === 'l') k = 'address';
+      else if (ctrl && key === 'h') k = 'history';
+      else if (ctrl && key === 'r') k = 'reload';
       else if (ctrl && key === 'tab') k = input.shift ? 'prev' : 'next';
+      else if (ctrl && key === 'pagedown') k = 'next';
+      else if (ctrl && key === 'pageup') k = 'prev';
+      else if (ctrl && !input.shift && /^[1-9]$/.test(key)) k = 'tab' + key;
       else if (key === 'f5') k = 'reload';
+      else if (key === 'f11') k = 'fullscreen';
       else if (input.alt && key === 'arrowleft') k = 'back';
       else if (input.alt && key === 'arrowright') k = 'forward';
       if (k) { e.preventDefault(); this.emit('browser:shortcut', k); }
@@ -205,6 +213,7 @@ class BrowserManager {
     // Per-site light / dark: Dark Reader runs from the page preload; this makes sites with
     // their own dark theme follow the same choice (they'd otherwise follow Windows' theme).
     this.attachScheme(wc);
+    if (process.env.IMAGESEEK_DEBUG) wc.on('console-message', (e) => console.log('[page]', e.message));
     wc.on('did-start-navigation', (d) => { if (d.isMainFrame && !d.isSameDocument) this.applyScheme(wc, d.url); });
     wc.on('destroyed', () => this.bindings.delete(wc.id));
   }
@@ -249,32 +258,33 @@ class BrowserManager {
   }
 
   // ---------- context menu ----------
+  // Right-click menu. The underlined letter (& in a label) is the key that picks that item
+  // while the menu is open, e.g. V = Save image as…
   contextMenu(wc, params) {
     const itemId = this.bindings.get(wc.id) || null;
     const it = itemId ? this.lib.item(itemId) : null;
+    const esc = (t) => String(t).replace(/&/g, '&&');
     const tmpl = [];
     const src = params.mediaType === 'image' ? params.srcURL : null;
     if (src) {
-      const label = it ? `Save image to "${trim(it.name, 32)}"` : 'Save image (unlinked)';
-      tmpl.push({ label, click: () => this.saveUrl(wc, src, itemId) });
-      const orig = originalCandidates(src);
-      if (orig.length) tmpl.push({ label: it ? 'Save original size to linked folder' : 'Save original size (unlinked)', click: () => this.saveOriginal(wc, src, itemId) });
-      if (it) tmpl.push({ label: 'Save image as unlinked', click: () => this.saveUrl(wc, src, null) });
-      tmpl.push({ label: 'Save image as… (choose a folder)', click: () => this.saveAs(wc, src) });
+      tmpl.push({ label: it ? `&Save image to "${esc(trim(it.name, 32))}"` : '&Save image (unlinked)', click: () => this.saveUrl(wc, src, itemId) });
+      if (originalCandidates(src).length) tmpl.push({ label: it ? 'Save &original size to the linked file' : 'Save &original size (unlinked)', click: () => this.saveOriginal(wc, src, itemId) });
+      if (it) tmpl.push({ label: 'Save image as &unlinked', click: () => this.saveUrl(wc, src, null) });
+      tmpl.push({ label: 'Sa&ve image as… (choose a folder)', click: () => this.saveAs(wc, src) });
       tmpl.push({ type: 'separator' });
-      tmpl.push({ label: 'Open image in new tab', click: () => this.emit('browser:open', { url: src, active: true, itemId }) });
-      tmpl.push({ label: 'Search this image with Google Lens', click: () => this.emit('browser:open', { url: 'https://lens.google.com/uploadbyurl?url=' + encodeURIComponent(src), active: true, itemId }) });
-      tmpl.push({ label: 'Copy image', click: () => wc.copyImageAt(params.x, params.y) });
-      tmpl.push({ label: 'Copy image address', click: () => clipboard.writeText(src) });
+      tmpl.push({ label: 'Open image in new &tab', click: () => this.emit('browser:open', { url: src, active: true, itemId }) });
+      tmpl.push({ label: 'Search this image with &Google Lens', click: () => this.emit('browser:open', { url: 'https://lens.google.com/uploadbyurl?url=' + encodeURIComponent(src), active: true, itemId }) });
+      tmpl.push({ label: '&Copy image', click: () => wc.copyImageAt(params.x, params.y) });
+      tmpl.push({ label: 'Copy image &address', click: () => clipboard.writeText(src) });
       tmpl.push({ type: 'separator' });
     }
     if (params.linkURL) {
-      tmpl.push({ label: 'Open link in new tab', click: () => this.emit('browser:open', { url: params.linkURL, active: false, itemId }) });
-      tmpl.push({ label: 'Copy link address', click: () => clipboard.writeText(params.linkURL) });
+      tmpl.push({ label: 'Open &link in new tab', click: () => this.emit('browser:open', { url: params.linkURL, active: false, itemId }) });
+      tmpl.push({ label: 'Copy link addr&ess', click: () => clipboard.writeText(params.linkURL) });
       if (/\.(jpe?g|png|webp|gif|avif|bmp)(\?|$)/i.test(params.linkURL)) {
-        tmpl.push({ label: it ? 'Save linked image to linked folder' : 'Save linked image (unlinked)', click: () => this.saveUrl(wc, params.linkURL, itemId) });
+        tmpl.push({ label: it ? '&Download linked image to the linked file' : '&Download linked image (unlinked)', click: () => this.saveUrl(wc, params.linkURL, itemId) });
       }
-      tmpl.push({ label: 'Save link as… (choose a folder)', click: () => this.saveAs(wc, params.linkURL) });
+      tmpl.push({ label: 'Save lin&k as… (choose a folder)', click: () => this.saveAs(wc, params.linkURL) });
       tmpl.push({ type: 'separator' });
     }
     if (params.isEditable) {
@@ -283,15 +293,15 @@ class BrowserManager {
       tmpl.push({ role: 'copy' }, { type: 'separator' });
     }
     tmpl.push(
-      { label: 'Back', enabled: wc.navigationHistory.canGoBack(), click: () => wc.navigationHistory.goBack() },
-      { label: 'Forward', enabled: wc.navigationHistory.canGoForward(), click: () => wc.navigationHistory.goForward() },
-      { label: 'Reload', click: () => wc.reload() },
+      { label: '&Back', enabled: wc.navigationHistory.canGoBack(), click: () => wc.navigationHistory.goBack() },
+      { label: '&Forward', enabled: wc.navigationHistory.canGoForward(), click: () => wc.navigationHistory.goForward() },
+      { label: '&Reload', click: () => wc.reload() },
     );
     try {
       const extItems = this.extensions.getContextMenuItems(wc, params);
       if (extItems.length) tmpl.push({ type: 'separator' }, ...extItems);
     } catch (_) { /* ignore */ }
-    tmpl.push({ type: 'separator' }, { label: 'Inspect element', click: () => wc.inspectElement(params.x, params.y) });
+    tmpl.push({ type: 'separator' }, { label: '&Inspect element', click: () => wc.inspectElement(params.x, params.y) });
     Menu.buildFromTemplate(cleanSeparators(tmpl)).popup({ window: this.getWindow() });
   }
 

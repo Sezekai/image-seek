@@ -50,8 +50,6 @@ export class ItemDetail {
 
   async refresh() { if (this.id) await this.show(this.id); }
 
-  keydown(e) { return this.sortPanel ? this.sortPanel.api.key(e) : false; }
-
   render() {
     const old = this.el.querySelector('.scroll');
     // Keep the scroll position only when the same file is being refreshed.
@@ -104,7 +102,7 @@ export class ItemDetail {
       scroll.appendChild(h('div', { class: 'section', style: { background: 'var(--accent-bg)' } },
         h('div', { class: 'row' }, icon('sparkle'),
           h('div', { class: 'grow small' }, h('b', null, 'Larger version exists: '), `${fmtDims(it.bigger.width, it.bigger.height)} on ${it.bigger.site}`),
-          it.bigger.url ? btn('Open', { cls: 'sm primary', onclick: () => this.open(it.bigger.url) }) : null)));
+          it.bigger.url ? btn('Open', { cls: 'sm primary', onclick: (e) => this.open(it.bigger.url, e.ctrlKey) }) : null)));
     }
 
     // ---- guess
@@ -114,11 +112,12 @@ export class ItemDetail {
         class: 'chip' + (i === 0 ? ' green' : ''), title: `Score ${v.score} · ${v.sources.join(', ')}${kind === 'series' ? ' — click to filter sort folders' : ' — click to copy'}`,
         onclick: () => { if (this.sortPanel && kind === 'series') this.sortPanel.api.setFilter(v.name); navigator.clipboard.writeText(v.name).catch(() => {}); },
       }, v.name)) : h('span', { class: 'dim xs' }, it.status === 'queued' || it.status === 'looking' ? '…' : 'unknown')));
-    scroll.appendChild(h('div', { class: 'section' }, h('h3', null, 'Best guess'),
-      group('Series', g.series, 'series'), group('Characters', g.characters, 'char'), group('Artist', g.artists, 'artist')));
+    // Only the parts of the guess that found something.
+    const groups = [['Series', g.series || [], 'series'], ['Characters', g.characters || [], 'char'], ['Artist', g.artists || [], 'artist']].filter(([, l]) => l.length);
+    if (groups.length) scroll.appendChild(h('div', { class: 'section' }, h('h3', null, 'Best guess'), groups.map(([l, list, k]) => group(l, list, k))));
 
-    // ---- downloaded versions + sorting
-    scroll.appendChild(this.renderVersions(it));
+    // ---- downloaded versions (only when there are some) + sorting
+    if (this.versions(it).length) scroll.appendChild(this.renderVersions(it));
     if (it.status !== 'done') scroll.appendChild(this.renderSort(it));
 
     // ---- manual search
@@ -168,7 +167,7 @@ export class ItemDetail {
       if (d.state !== 'completed') continue;
       targets.push({ kind: 'download', id: d.id, label: d.name || basename(d.path), path: d.path, sub: fmtDims(d.width, d.height) });
     }
-    sec.appendChild(h('h3', null, 'Sort into', h('span', { class: 'grow' }), h('span', { class: 'dim', style: { textTransform: 'none', letterSpacing: 0 } }, '1–9 · N · V')));
+    sec.appendChild(h('h3', null, 'Sort into', h('span', { class: 'grow' }), h('span', { class: 'dim', style: { textTransform: 'none', letterSpacing: 0 } }, '/ · 1–9 · N · V')));
     if (!targets.length) {
       sec.appendChild(h('div', { class: 'dim xs' }, 'Nothing left to sort for this file.'));
       return sec;
@@ -178,7 +177,7 @@ export class ItemDetail {
       if (it.phase === 'compare') sec.appendChild(h('div', { class: 'xs muted', style: { marginBottom: '6px' } }, 'Tip: Compare first to keep the best and recycle the rest — or sort any of them directly.'));
       sec.appendChild(h('div', { class: 'sort-targets' }, targets.map((t) => h('label', { class: 'check' },
         h('input', { type: 'radio', name: 'sorttarget', checked: t.kind === this.target.kind && t.id === this.target.id, onchange: () => { this.target = t; } }),
-        h('img', { src: thumbUrl(t.path, 120) }), h('span', { class: 'ell' }, t.label), h('span', { class: 'xs dim' }, t.sub)))));
+        h('img', { src: thumbUrl(t.path, 120) }), h('span', { class: 'ell', title: t.label }, t.label), h('span', { class: 'xs dim' }, t.sub)))));
     }
     this.sortPanel = createSortPanel({ target: () => this.target && { kind: this.target.kind, id: this.target.id }, compact: true, onSorted: () => emit('item-sorted', it.id) });
     sec.appendChild(this.sortPanel);
@@ -253,11 +252,16 @@ export class ItemDetail {
         h('div', { class: 'row' }, h('span', { class: 'chip' }, r.site), bigger ? h('span', { class: 'chip green' }, 'larger') : null),
         h('div', { class: 'rt ell', title }, title),
         sub.length ? h('div', { class: 'xs dim ell' }, sub.join(' · ')) : null,
-        h('div', { class: 'links' }, links.slice(0, 5).map((u) => h('a', { title: u + '\n(opens in a new tab)', onclick: () => this.open(u) }, shortUrl(u))))),
+        h('div', { class: 'links' }, links.slice(0, 5).map((u) => h('a', {
+          title: u + '\nClick: open in this file\'s tab · Ctrl+click or middle-click: new tab',
+          onclick: (e) => this.open(u, e.ctrlKey || e.metaKey),
+          onmousedown: (e) => { if (e.button === 1) e.preventDefault(); },
+          onauxclick: (e) => { if (e.button === 1) { e.preventDefault(); this.open(u, true); } },
+        }, shortUrl(u))))),
       h('div', { class: 'sim ' + simClass(r.similarity) }, r.similarity != null ? r.similarity.toFixed(r.similarity >= 99.95 ? 0 : 1) + '%' : '#' + (r.rank + 1)));
   }
 
-  open(url) { emit('open-url', { url, itemId: this.item && this.item.id }); }
+  open(url, newTab) { emit('open-url', { url, itemId: this.item && this.item.id, newTab: !!newTab, fromLinks: true }); }
 
   async recycle() {
     const it = this.item;

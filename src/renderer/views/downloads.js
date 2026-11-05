@@ -1,7 +1,7 @@
 // Every downloaded file and the file it's linked to. Unlink, relink, recycle or sort them.
 import {
   api, state, h, icon, btn, seg, clear, thumbUrl, fileUrl, fmtBytes, fmtDims, fmtTime, toast, on, emit,
-  popupMenu, viewImage, hostOf, basename, makeResizable, confirmBox, dHash, hamming,
+  popupMenu, viewImage, hostOf, basename, makeResizable, confirmBox, dHash, hamming, lsGet, lsSet,
 } from '../core.js';
 import { createSortPanel } from '../sortpanel.js';
 
@@ -21,12 +21,14 @@ export class DownloadsView {
     this.seg = seg(this.opts(), this.filter, (v) => { this.filter = v; this.render(); });
     this.search = h('input', { class: 'input search', placeholder: 'Search downloads', style: { width: '240px' }, oninput: () => { this.q = this.search.value.trim().toLowerCase(); this.render(); } });
     this.listEl = h('div', { class: 'scroll' });
+    this.mode = lsGet('downloads-view', 'cards');
+    this.modeSeg = seg([{ value: 'cards', icon: 'cards', label: 'Cards' }, { value: 'list', icon: 'list', label: 'List' }], this.mode, (v) => { this.mode = v; lsSet('downloads-view', v); this.render(); });
     this.side = h('div', { class: 'side', style: { '--side-w': '440px' } });
     makeResizable(this.side, 'downloads', 340, 800);
     this.sideBody = h('div', { class: 'scroll' });
     this.side.appendChild(this.sideBody);
     this.root.append(
-      h('div', { class: 'toolbar' }, h('span', { class: 'title' }, 'Downloads'), this.seg, this.search, h('div', { class: 'grow' }),
+      h('div', { class: 'toolbar' }, h('span', { class: 'title' }, 'Downloads'), this.modeSeg, this.seg, this.search, h('div', { class: 'grow' }),
         btn('Open downloads folder', { icon: 'folder', onclick: () => api.call('shell:open', state.settings.downloadsDir) })),
       h('div', { class: 'split' }, h('div', { class: 'main' }, this.listEl), this.side));
   }
@@ -61,6 +63,13 @@ export class DownloadsView {
     if (!list.length) {
       this.listEl.appendChild(h('div', { class: 'empty' }, icon('download'), h('div', null, all.length ? 'Nothing matches.' : 'Files you download in the app\'s browser appear here.')));
     }
+    if (this.mode === 'cards' && list.length) {
+      const grid = h('div', { class: 'cards' });
+      for (const d of list) grid.appendChild(this.card(d));
+      this.listEl.appendChild(grid);
+      this.renderSide();
+      return;
+    }
     for (const d of list) {
       const it = d.itemId && state.items.get(d.itemId);
       const row = h('div', { class: 'list-row', style: { cursor: 'pointer', background: this.sel === d.id ? 'var(--accent-bg)' : '' }, onclick: () => { this.sel = d.id; this.render(); } },
@@ -75,6 +84,23 @@ export class DownloadsView {
       this.listEl.appendChild(row);
     }
     this.renderSide();
+  }
+
+  card(d) {
+    const it = d.itemId && state.items.get(d.itemId);
+    const bigger = it && d.width && it.width && d.width * d.height > it.width * it.height;
+    return h('div', { class: 'lcard click' + (this.sel === d.id ? ' sel' : ''), onclick: () => { this.sel = d.id; this.render(); }, ondblclick: () => d.state === 'completed' && viewImage(fileUrl(d.path)) },
+      h('div', { class: 'lthumb' }, d.state === 'completed' ? h('img', { src: thumbUrl(d.path, 400), loading: 'lazy', onerror: (e) => { e.target.style.visibility = 'hidden'; } }) : h('span', { class: 'spin' })),
+      h('div', { class: 'lbody' },
+        h('div', { class: 'lname ell', title: d.name || basename(d.path) }, d.name || basename(d.path)),
+        h('div', { class: 'lsub ell' }, `${fmtDims(d.width, d.height)} · ${fmtBytes(d.size || d.total)} · ${hostOf(d.pageUrl || d.url)}`),
+        h('div', { class: 'lchips' },
+          bigger ? h('span', { class: 'chip green' }, 'larger') : null,
+          this.isFlagged(d) ? h('span', { class: 'chip warn' }, 'unrelated?') : null,
+          d.state === 'progress' ? h('div', { class: 'progress', dataset: { dl: d.id } }, h('div')) : null),
+        it ? h('div', { class: 'llink', title: 'Linked to ' + it.name }, icon('link'), h('img', { src: thumbUrl(it.path, 80) }), h('span', { class: 'ell' }, it.name))
+          : h('div', { class: 'llink dim' }, icon('unlink'), 'Unlinked'),
+        h('div', { class: 'lfoot' }, h('span', null, fmtTime(d.time)))));
   }
 
   progress({ id, received, total }) {

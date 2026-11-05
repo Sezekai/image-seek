@@ -11,14 +11,39 @@ window.addEventListener('mouseup', (e) => {
   else if (e.button === 4) { e.preventDefault(); ipcRenderer.send('page:mousenav', 'forward'); }
 }, true);
 
+// ---------- '/' jumps to Image Seek's sort box (when you're not typing on the page) ----------
+window.addEventListener('keydown', (e) => {
+  if (e.key !== '/' || e.ctrlKey || e.altKey || e.metaKey) return;
+  const t = e.target;
+  const typing = t && (t.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName));
+  if (typing) return;
+  e.preventDefault();
+  e.stopPropagation();
+  ipcRenderer.send('page:hotkey', '/');
+}, true);
+
+// ---------- scrollbars: thin, no track background (matches the app) ----------
+try {
+  webFrame.insertCSS('::-webkit-scrollbar{width:10px;height:10px;background:transparent}' +
+    '::-webkit-scrollbar-track,::-webkit-scrollbar-corner,::-webkit-scrollbar-track-piece{background:transparent}' +
+    '::-webkit-scrollbar-button{display:none;width:0;height:0}' +
+    '::-webkit-scrollbar-thumb{background-color:rgba(128,128,128,.45);border-radius:10px;border:2px solid transparent;background-clip:padding-box}' +
+    '::-webkit-scrollbar-thumb:hover{background-color:rgba(128,128,128,.7)}');
+} catch (_) { /* ignore */ }
+
 // ---------- dark mode ----------
+// Dark Reader is started as soon as the page's document exists (the preload runs before that,
+// which is why it used to fail silently). An early dark background avoids a white flash.
 if (config.dark && window.top === window) {
   try {
+    webFrame.insertCSS('html, body { background-color: #181a1b !important; } html { color-scheme: dark; }');
     const code = ipcRenderer.sendSync('page:darkreader');
     webFrame.executeJavaScript(
       '(function(){var exports, module, define;' + code +
       '\n;try{DarkReader.setFetchMethod(window.fetch.bind(window));}catch(e){}' +
-      'DarkReader.enable({brightness:100,contrast:95,sepia:0});})();'
+      'var go=function(){ if(!document.documentElement) return false; try{ DarkReader.enable({brightness:100,contrast:95,sepia:0}); }catch(e){ console.warn("Dark Reader:", e && e.message); } return true; };' +
+      'if(!go()){ var mo=new MutationObserver(function(){ if(go()) mo.disconnect(); }); mo.observe(document,{childList:true,subtree:true}); }' +
+      '})();'
     ).catch(() => {});
   } catch (_) { /* ignore */ }
 }
