@@ -288,6 +288,27 @@ function setupIpc() {
     return { added: r.added, skipped: r.skipped, batchId: r.batch.id };
   });
   handle('batch:remove', async (id) => { lib.removeBatch(id); watcher.refresh(); });
+  handle('batch:relocate', async (id, folder) => {
+    const r = await lib.relocateBatch(id, folder);
+    log(`Folder moved: ${r.from} → ${r.to}${r.restored ? `, ${r.restored} file(s) back in the list` : ''}`);
+    watcher.refresh();
+    queue.kick();
+    return r;
+  });
+  handle('batch:find', async (id) => {
+    const r = await lib.findMissingFolders(id || null);
+    if (r.found) { log(`Found the folder again at ${r.found}`); watcher.refresh(); queue.kick(); }
+    return r;
+  });
+  handle('lib:backups', async () => lib.listBackups());
+  handle('lib:backupNow', async () => lib.backup('manual'));
+  handle('lib:restoreBackup', async (file) => {
+    const r = await lib.restoreBackup(file);
+    log(`Restored the library from a backup: ${r.items} file(s), ${r.folders} folder(s)`);
+    watcher.refresh();
+    queue.kick();
+    return r;
+  });
 
   handle('lib:snapshot', async () => lib.snapshot());
   handle('lib:light', async () => lib.light());
@@ -466,6 +487,14 @@ app.whenReady().then(async () => {
   // full rescan of the added folders at start and every 5 minutes.
   const onReconciled = (r) => {
     if (!r) return;
+    for (const ev of r.events || []) {
+      if (ev.type === 'folder-moved') log(`Folder "${ev.name}" was renamed or moved — found it at ${ev.to}${ev.restored ? `, ${ev.restored} file(s) back in the list` : ''}`);
+      else if (ev.type === 'folder-missing') log(`Folder not found: ${ev.from} — nothing from it has been removed. Use "Find folder…" in Lookups to point at its new place.`, 'warn');
+      else if (ev.type === 'folder-back') log(`Folder "${ev.name}" is back`);
+      else if (ev.type === 'root-missing') log(`Your ${ev.what} is missing (${ev.from}) — those files are left alone until it is back. Check it in Settings.`, 'warn');
+      else if (ev.type === 'backup') log(`${ev.count} file(s) went missing — saved a library backup first (Settings → Backups)`, 'warn');
+    }
+    if (r.events && r.events.some((e) => e.type === 'folder-missing' || e.type === 'folder-moved')) watcher.refresh();
     if (r.added && r.added.length) {
       const byBatch = new Map();
       for (const it of r.added) { const b = lib.d.batches.find((x) => x.id === it.batchId); const k = b ? b.name : 'a folder'; byBatch.set(k, (byBatch.get(k) || 0) + 1); }

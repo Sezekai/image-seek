@@ -60,7 +60,8 @@ export class LookupsView {
     this.side.appendChild(this.detailHost);
     this.detail = new ItemDetail(this.detailHost);
     this.detail.render();
-    this.root.append(this.toolbar, h('div', { class: 'split' }, this.mainEl, this.side));
+    this.banner = h('div', { class: 'banner hidden' });
+    this.root.append(this.toolbar, this.banner, h('div', { class: 'split' }, this.mainEl, this.side));
 
     this.grid.addEventListener('scroll', () => this.renderVisible());
     new ResizeObserver(() => this.layout()).observe(this.grid);
@@ -88,17 +89,49 @@ export class LookupsView {
     clear(this.batchSel);
     this.batchSel.appendChild(h('option', { value: 'all' }, `All folders (${state.batches.length})`));
     for (const b of state.batches) {
-      this.batchSel.appendChild(h('option', { value: b.id }, `${b.name} (${b.counts.total - b.counts.done}/${b.counts.total})`));
+      this.batchSel.appendChild(h('option', { value: b.id }, `${b.missing ? '⚠ ' : ''}${b.name} (${b.counts.total - b.counts.done}/${b.counts.total})`));
     }
     this.batchSel.value = state.batches.some((b) => b.id === cur) ? cur : 'all';
     this.batch = this.batchSel.value;
     this.renderBatchBtn();
+    this.renderBanner();
+  }
+
+  // Shown when a folder you added can't be found — nothing from it is removed meanwhile.
+  renderBanner() {
+    const lost = state.batches.filter((b) => b.missing);
+    this.banner.classList.toggle('hidden', !lost.length);
+    clear(this.banner);
+    for (const b of lost) {
+      const n = [...state.items.values()].filter((i) => i.batchId === b.id).length;
+      this.banner.appendChild(h('div', { class: 'brow' }, icon('warn'),
+        h('div', { class: 'grow col', style: { gap: '1px' } },
+          h('div', null, h('b', null, `Can't find the folder "${b.name}"`), `  —  ${n} file${n === 1 ? '' : 's'} kept and left alone`),
+          h('div', { class: 'xs dim ell', title: b.folder }, b.folder)),
+        btn('Find folder…', { icon: 'folder', cls: 'sm primary', onclick: () => this.relocate(b) }),
+        btn('Search again', { icon: 'search', cls: 'sm', title: 'Look for it again by name and contents', onclick: () => this.findAgain(b) }),
+        btn('', { icon: 'x', cls: 'sm icon ghost danger', title: 'Remove this folder from Image Seek', onclick: () => { this.batch = b.id; this.removeBatch(); } })));
+    }
+  }
+
+  async relocate(b) {
+    const folder = await api.call('dialog:folder', `Where is "${b.name}" now?`, b.folder);
+    if (!folder) return;
+    const r = await safe(() => api.call('batch:relocate', b.id, folder));
+    if (r) toast(`Folder updated — ${r.total} file${r.total === 1 ? '' : 's'} back in the list${r.restored ? ` (${r.restored} recovered)` : ''}`, 'info', 6000);
+  }
+
+  async findAgain(b) {
+    toast('Looking for the folder…', 'info', 2500);
+    const r = await safe(() => api.call('batch:find', b.id));
+    if (r && r.found) toast(`Found it at ${r.found}`, 'info', 6000);
+    else if (r) toast('Couldn\'t find it — use "Find folder…" to point at it', 'warn', 6000);
   }
 
   renderBatchBtn() {
     this.batchRemove.classList.toggle('hidden', this.batch === 'all');
     const b = state.batches.find((x) => x.id === this.batch);
-    this.batchSel.title = b ? b.folder + (state.settings.autoAdd !== false ? '\nNew images saved here are picked up automatically' : '') : '';
+    this.batchSel.title = b ? b.folder + (b.missing ? '\nThis folder can\'t be found right now' : state.settings.autoAdd !== false ? '\nNew images saved here are picked up automatically' : '') : '';
   }
 
   async removeBatch() {

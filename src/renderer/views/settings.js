@@ -1,5 +1,5 @@
 // Settings: folders, lookups, browser, Firefox import, resets.
-import { api, state, h, icon, btn, seg, clear, toast, on, emit, confirmBox, modal, fmtTime, ENGINE_LABEL } from '../core.js';
+import { api, state, h, icon, btn, seg, clear, toast, on, emit, confirmBox, modal, fmtTime, fmtBytes, ENGINE_LABEL } from '../core.js';
 
 export class SettingsView {
   constructor(root) {
@@ -108,6 +108,11 @@ export class SettingsView {
     this.wrap.appendChild(ffCard);
     this.renderFirefox(ffCard);
 
+    // ---------- backups
+    const bk = h('div', { class: 'card' }, h('h2', null, icon('save'), 'Library backups'));
+    this.wrap.appendChild(bk);
+    this.renderBackups(bk);
+
     // ---------- reset
     const reset = (what, label, text) => btn(label, { cls: 'danger', onclick: async () => {
       if (!(await confirmBox(label + '?', text, 'Reset'))) return;
@@ -123,6 +128,35 @@ export class SettingsView {
         reset('browser', 'Clear cookies & cache', 'Sign out of every site in the app\'s browser.'),
         reset('thumbs', 'Clear thumbnail cache', 'Thumbnails are rebuilt as needed.')),
       h('div', { class: 'hint' }, `Image Seek ${state.version} · data folder: ${state.paths.data}`)));
+  }
+
+  // A copy of the file list is kept automatically before anything risky (and whenever files go
+  // missing in bulk), so a bad rename or a disconnected drive can always be undone.
+  async renderBackups(card) {
+    const list = await api.call('lib:backups').catch(() => []);
+    card.appendChild(h('div', { class: 'hint' }, 'Image Seek keeps a copy of your file list, lookup results and download links before anything risky — and whenever a lot of files suddenly go missing. The last 15 copies are kept. Your images are never touched.'));
+    if (!list.length) card.appendChild(h('div', { class: 'xs dim' }, 'No backups yet.'));
+    for (const b of list) {
+      card.appendChild(h('div', { class: 'backup-row' },
+        icon('save'),
+        h('div', { class: 'grow col', style: { gap: '1px', minWidth: '0' } },
+          h('div', null, fmtTime(b.time), b.reason ? h('span', { class: 'chip', style: { marginLeft: '6px' } }, REASON[b.reason] || b.reason) : null),
+          h('div', { class: 'xs dim ell' }, `${b.items} file${b.items === 1 ? '' : 's'} · ${b.folders} folder${b.folders === 1 ? '' : 's'} · ${fmtBytes(b.size)}`)),
+        btn('Restore', { icon: 'undo', cls: 'sm', onclick: async () => {
+          if (!(await confirmBox('Restore this backup?', `Your file list goes back to how it was on ${fmtTime(b.time)} — ${b.items} files. A copy of the current list is saved first, so this can be undone. No images on disk are touched.`, 'Restore'))) return;
+          try {
+            const r = await api.call('lib:restoreBackup', b.file);
+            toast(`Restored ${r.items} files in ${r.folders} folders`);
+            this.render();
+          } catch (e) { toast(e.message, 'error'); }
+        } })));
+    }
+    card.appendChild(h('div', { class: 'row', style: { marginTop: '6px' } },
+      btn('Back up now', { icon: 'save', cls: 'sm primary', onclick: async () => {
+        await api.call('lib:backupNow').catch((e) => toast(e.message, 'error'));
+        toast('Backed up');
+        this.render();
+      } })));
   }
 
   async renderFirefox(card) {
@@ -191,3 +225,10 @@ export class SettingsView {
 }
 
 void fmtTime;
+
+const REASON = {
+  'files-missing': 'files went missing',
+  'before-restore': 'before a restore',
+  manual: 'manual',
+  'folder-move': 'folder moved',
+};

@@ -82,6 +82,7 @@ const P = {
   rows: '<rect x="4" y="3" width="16" height="8" rx="1.5"/><rect x="4" y="13" width="16" height="8" rx="1.5"/>',
   fit: '<path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/>',
   zoom: '<circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5M11 8v6M8 11h6"/>',
+  save: '<path d="M4 4h11l5 5v11H4z"/><path d="M8 4v5h7"/><path d="M8 20v-6h8v6"/>',
   undo: '<path d="M9 14 4 9l5-5"/><path d="M4 9h10a6 6 0 0 1 0 12h-3"/>',
   sort: '<path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><path d="m10 13 2 2 3-4"/>',
   warn: '<path d="M12 3 2 20h20z"/><path d="M12 10v4M12 17h.01"/>',
@@ -160,6 +161,37 @@ export function fmtBytes(n) {
 }
 export function fmtDims(w, h) { return w && h ? `${w}×${h}` : '—'; }
 export function fmtMp(w, h) { return w && h ? (w * h / 1e6).toFixed(w * h < 1e7 ? 2 : 1) + ' MP' : '—'; }
+// 0:09 · 1:45 · 12:30 · 2:05:11
+export function fmtDuration(ms) {
+  if (ms == null || !isFinite(ms) || ms < 0) return '—';
+  const t = Math.round(ms / 1000);
+  const h = Math.floor(t / 3600), m = Math.floor((t % 3600) / 60), sec = t % 60;
+  return h ? `${h}:${String(m).padStart(2, '0')}:${String(sec).padStart(2, '0')}` : `${m}:${String(sec).padStart(2, '0')}`;
+}
+
+// A progress bar with a percentage, how long it has been going and how much is left.
+export function progressBar() {
+  const fill = h('div');
+  const bar = h('div', { class: 'progress wide' }, fill);
+  const pct = h('span', { class: 'pct' });
+  const stats = h('span', { class: 'ell' });
+  const el = h('div', { class: 'col', style: { gap: '3px', minWidth: '0' } }, bar, h('div', { class: 'dl-stats' }, pct, stats));
+  // done / total in bytes (or items), started = ms timestamp
+  el.set = ({ done, total, started, unit = 'bytes', label = '' }) => {
+    const frac = total > 0 ? Math.min(1, done / total) : 0;
+    fill.style.width = (total > 0 ? frac * 100 : 0) + '%';
+    bar.classList.toggle('unknown', !(total > 0));
+    pct.textContent = total > 0 ? Math.round(frac * 100) + '%' : '';
+    const el2 = started ? Date.now() - started : 0;
+    const left = total > 0 && done > 0 && started ? (el2 / done) * (total - done) : null;
+    const amount = unit === 'bytes'
+      ? `${fmtBytes(done)}${total > 0 ? ' of ' + fmtBytes(total) : ''}`
+      : `${done}${total > 0 ? ' of ' + total : ''}`;
+    stats.textContent = [label, amount, started ? `${fmtDuration(el2)} elapsed` : null, left != null ? `${fmtDuration(left)} left` : null].filter(Boolean).join('  ·  ');
+  };
+  return el;
+}
+
 export function fmtTime(t) {
   const d = new Date(t);
   const now = new Date();

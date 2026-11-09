@@ -30,6 +30,8 @@ class LookupQueue {
     this.traceWaitUntil = 0;
     this.iqdbBusyUntil = 0; // site-wide pause after a busy page
     this.wakeTimer = null;
+    this.runStart = 0; // this run of the queue, for progress and the time estimate
+    this.runDone = 0;
   }
 
   status() {
@@ -43,6 +45,9 @@ class LookupQueue {
       waiting: waiting.length,
       waitingSauce: waiting.filter((i) => i.engines.saucenao === 'waiting').length,
       waitingIqdb: waiting.filter((i) => i.engines.iqdb === 'waiting').length,
+      progress: this.running || this.runDone
+        ? { done: this.runDone, total: this.runDone + items.filter((i) => i.status === 'queued' || i.status === 'looking').length, started: this.runStart }
+        : null,
       sauceQuota: this.sauceQuota,
       sauceWaitUntil: this.sauceWaitUntil,
       iqdbBusyUntil: this.iqdbBusyUntil,
@@ -86,12 +91,15 @@ class LookupQueue {
 
   async run() {
     this.running = true;
+    this.runStart = Date.now();
+    this.runDone = 0;
     this.pushStatus();
     try {
       while (!this.settings.get().queuePaused) {
         const it = this.nextItem();
         if (!it) break;
         await this.process(it);
+        this.runDone++;
       }
     } finally {
       this.running = false;

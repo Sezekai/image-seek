@@ -20,7 +20,7 @@ class FolderWatcher {
   // (Re)create watchers to match the current folders.
   refresh() {
     const roots = [];
-    for (const r of this.lib.watchedRoots()) {
+    for (const r of [...this.lib.watchedRoots(), ...this.lib.probeRoots()]) {
       if (!r.path || !fs.existsSync(r.path)) continue;
       // Skip a folder already covered by a recursive watch on a parent folder.
       if (roots.some((o) => o.recursive && inside(o.path, r.path))) continue;

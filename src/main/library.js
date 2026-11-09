@@ -17,13 +17,19 @@ const newId = () => crypto.randomBytes(5).toString('hex');
 
 // A file's identity on Windows (volume serial + NTFS file index). It survives renames and moves
 // on the same drive, which lets the app follow files you rename or move in Explorer.
-async function fidOf(p) {
+async function fidOf(p, allowDir) {
   try {
     const st = await fsp.stat(p, { bigint: true });
-    if (!st.isFile() || !st.ino) return null; // FAT/exFAT drives have no stable index
+    if (!st.ino) return null; // FAT/exFAT drives have no stable index
+    if (!(st.isFile() || (allowDir && st.isDirectory()))) return null;
     return `${st.dev}:${st.ino}`;
   } catch { return null; }
 }
+// Folders have a stable id too, so a renamed or moved folder can be found again.
+const dirFid = (p) => fidOf(p, true);
+
+// Folders never worth searching through.
+const SKIP_DIR = /^(\$recycle\.bin|system volume information|windows|winsxs|program files( \(x86\))?|programdata|\$winreagent|config\.msi|recovery|appdata|node_modules|\.git|\.cache)$/i;
 const DAY = 24 * 60 * 60 * 1000;
 const LOG_KEEP_MISSING = 30 * DAY;
 
@@ -37,6 +43,7 @@ class Library {
     });
     this.migrate();
     this.checking = false;
+    this.events = [];
   }
 
   get d() { return this.store.data; }
@@ -105,6 +112,8 @@ class Library {
     const batch = existing || { id: newId(), folder, recursive: !!recursive, created: Date.now(), name: path.basename(folder) || folder };
     if (existing) existing.recursive = existing.recursive || !!recursive;
     else this.d.batches.push(batch);
+    batch.fid = await dirFid(folder);
+    delete batch.missing;
     const files = await fo.listImages(folder, batch.recursive);
     const added = await this.addFiles(batch, files);
     this.changed([]);
@@ -121,19 +130,58 @@ class Library {
   async addFiles(batch, files) {
     const known = this.knownPaths();
     const added = [];
+    const revived = [];
     for (const f of files) {
       if (known.has(f.toLowerCase())) continue;
+      const fid = await fidOf(f);
+      // A file that was dropped earlier (because it had gone missing) comes back with its
+      // lookup results instead of being treated as brand new.
+      const back = this.revive(f, fid, batch);
+      if (back) {
+        known.add(f.toLowerCase());
+        revived.push(back);
+        continue;
+      }
       const it = {
         id: newId(), batchId: batch.id, path: f, name: path.basename(f),
         status: 'queued', phase: 'lookup', engines: {}, results: [], downloads: [], addedAt: Date.now(),
       };
       try { Object.assign(it, pickInfo(await getImageInfo(f))); } catch (_) { /* unreadable header */ }
-      it.fid = await fidOf(f);
+      it.fid = fid;
       this.d.items[it.id] = it;
       known.add(f.toLowerCase());
       added.push(it);
     }
-    return added;
+    return added.concat(revived);
+  }
+
+  // ---------- entries removed earlier, kept for 30 days so they can come back ----------
+  remember(it, reason) {
+    this.d.removed = this.d.removed || [];
+    this.d.removed.push({ removedAt: Date.now(), reason: reason || 'missing', item: JSON.parse(JSON.stringify(it)) });
+    if (this.d.removed.length > 4000) this.d.removed.splice(0, this.d.removed.length - 4000);
+  }
+
+  revive(filePath, fid, batch) {
+    const list = this.d.removed || [];
+    const low = filePath.toLowerCase();
+    const base = path.basename(filePath).toLowerCase();
+    let i = fid ? list.findIndex((r) => r.item.fid && r.item.fid === fid) : -1;
+    if (i < 0) i = list.findIndex((r) => r.item.path.toLowerCase() === low);
+    // Same name in the same folder (drives without stable file ids).
+    if (i < 0 && batch) i = list.findIndex((r) => r.item.batchId === batch.id && path.basename(r.item.path).toLowerCase() === base);
+    if (i < 0) return null;
+    const it = list.splice(i, 1)[0].item;
+    it.path = filePath;
+    it.name = path.basename(filePath);
+    it.fid = fid;
+    if (batch) it.batchId = batch.id;
+    delete it.originalMissing;
+    it.downloads = (it.downloads || []).filter((id) => this.d.downloads[id]);
+    if (it.status === 'done' && this.pending(it).length) it.status = 'looked';
+    if (it.status !== 'done') it.status = (it.results || []).length || Object.keys(it.engines || {}).length ? 'looked' : 'queued';
+    this.d.items[it.id] = it;
+    return it;
   }
 
   removeBatch(batchId) {
@@ -473,6 +521,234 @@ class Library {
     this.changed([]);
   }
 
+  // ---------- added folders that were renamed, moved or removed ----------
+  // When a whole folder goes missing, the files inside it are not "gone" — they moved with it.
+  // The folder is looked for by its own id, and failing that by the names of the files it held.
+  // Until it is found again (automatically or with "Find folder…"), nothing in it is dropped.
+  async checkFolders() {
+    if (this.checkingFolders) return [];
+    this.checkingFolders = true;
+    try { return await this._checkFolders(); } finally { this.checkingFolders = false; }
+  }
+
+  async _checkFolders() {
+    const events = [];
+    for (const b of this.d.batches) {
+      const fid = await dirFid(b.folder);
+      if (fid) {
+        if (b.fid !== fid) b.fid = fid;
+        if (b.missing) { delete b.missing; events.push({ type: 'folder-back', name: b.name, to: b.folder }); }
+        continue;
+      }
+      if (await fo.exists(b.folder)) continue; // there, but no readable id
+      // The search can take a while; if the folder was pointed somewhere else in the meantime
+      // (by "Find folder…", say), that answer wins and this one is thrown away.
+      const was = b.folder;
+      const found = await this.findFolder(b);
+      if (b.folder !== was) continue;
+      if (found) {
+        const back = await this.applyFolderMove(b, found);
+        events.push({ type: 'folder-moved', name: b.name, from: was, to: found, restored: back.length });
+      } else if (!b.missing && !(await fo.exists(b.folder))) {
+        b.missing = Date.now();
+        events.push({ type: 'folder-missing', name: b.name, from: b.folder, id: b.id });
+      }
+    }
+    return events;
+  }
+
+  // Names this folder is known to have held (live entries, ones removed earlier, and the log).
+  folderNames(b) {
+    const names = new Set();
+    const low = b.folder.toLowerCase() + path.sep;
+    const add = (p) => { if (p && p.toLowerCase().startsWith(low)) names.add(path.basename(p).toLowerCase()); };
+    for (const it of Object.values(this.d.items)) if (it.batchId === b.id) add(it.path);
+    for (const r of this.d.removed || []) if (r.item.batchId === b.id) add(r.item.path);
+    for (const l of this.d.sortLog) if (l.kind === 'gone' || l.kind === 'moved') add(l.from);
+    return [...names].slice(0, 400);
+  }
+
+  async findFolder(b) {
+    const seen = new Set();
+    const names = b.fid ? null : this.folderNames(b);
+    if (!b.fid && (!names || names.length < 2)) return null;
+    // The file IDs we remember, so a copy of the folder somewhere else isn't mistaken for it.
+    const wantFids = new Set();
+    if (!b.fid) {
+      for (const it of Object.values(this.d.items)) if (it.batchId === b.id && it.fid) wantFids.add(it.fid);
+      for (const r of this.d.removed || []) if (r.item.batchId === b.id && r.item.fid) wantFids.add(r.item.fid);
+    }
+    const match = async (dir) => {
+      if (b.fid) return (await dirFid(dir)) === b.fid;
+      // No folder id: a folder holding most of the same file names is the one, as long as at
+      // least one of those files is the same file and not a copy.
+      let entries;
+      try { entries = await fsp.readdir(dir); } catch { return false; }
+      if (!entries.length) return false;
+      const have = new Map(entries.map((n) => [n.toLowerCase(), n]));
+      const hits = [];
+      for (const n of names) if (have.has(n)) hits.push(have.get(n));
+      if (hits.length < Math.max(2, Math.ceil(names.length * 0.5))) return false;
+      if (!wantFids.size) return true; // nothing recorded to check against
+      for (const n of hits.slice(0, 8)) if (wantFids.has(await fidOf(path.join(dir, n)))) return true;
+      return false;
+    };
+    const scan = async (dir, depth) => {
+      const key = dir.toLowerCase();
+      if (seen.has(key)) return null;
+      seen.add(key);
+      let entries;
+      try { entries = await fsp.readdir(dir, { withFileTypes: true }); } catch { return null; }
+      const subs = [];
+      for (const e of entries) {
+        if (!e.isDirectory() || SKIP_DIR.test(e.name) || e.name.startsWith('.')) continue;
+        const full = path.join(dir, e.name);
+        if (await match(full)) return full;
+        subs.push(full);
+      }
+      if (depth > 0) for (const sdir of subs) { const r = await scan(sdir, depth - 1); if (r) return r; }
+      return null;
+    };
+    // 1. renamed where it was or shuffled around inside the same folder, 2. moved next door,
+    // 3. a bounded sweep of the same drive and the app's own folders.
+    const parent = path.dirname(b.folder);
+    const walked = new Set();
+    const r0 = await scan(parent, 0);
+    if (r0) return r0;
+    for (const dir of [parent, path.dirname(parent)]) {
+      const r = await this.sweep(dir, match, seen, 4000, 5000, walked);
+      if (r) return r;
+    }
+    const roots = [path.parse(b.folder).root, ...this.watchedRoots().map((r) => path.parse(r.path).root)];
+    for (const root of [...new Set(roots.filter(Boolean))]) {
+      const r = await this.sweep(root, match, seen, 30000, 15000, walked);
+      if (r) return r;
+    }
+    return null;
+  }
+
+  // Walks folders only (never files), widest first, with a time and count limit.
+  async sweep(root, match, seen, dirBudget = 30000, ms = 15000, walked = new Set()) {
+    const deadline = Date.now() + ms;
+    let budget = dirBudget;
+    const queue = [root];
+    while (queue.length && budget > 0 && Date.now() < deadline) {
+      const dir = queue.shift();
+      const key = dir.toLowerCase();
+      if (walked.has(key)) continue; // already looked inside this one
+      walked.add(key);
+      let entries;
+      try { entries = await fsp.readdir(dir, { withFileTypes: true }); } catch { continue; }
+      for (const e of entries) {
+        if (!e.isDirectory() || SKIP_DIR.test(e.name) || e.name.startsWith('.')) continue;
+        budget--;
+        const full = path.join(dir, e.name);
+        const ck = full.toLowerCase();
+        if (!seen.has(ck)) { // seen = already tested as a candidate
+          seen.add(ck);
+          if (await match(full)) return full;
+        }
+        queue.push(full);
+      }
+    }
+    return null;
+  }
+
+  // Points a folder at its new location and brings every file in it back.
+  async applyFolderMove(b, newPath) {
+    const from = b.folder;
+    b.folder = newPath;
+    b.name = path.basename(newPath) || newPath;
+    b.fid = await dirFid(newPath);
+    delete b.missing;
+    const low = from.toLowerCase();
+    for (const it of Object.values(this.d.items)) {
+      if (it.batchId !== b.id) continue;
+      if (it.originalSorted || this.originalGone(it)) continue;
+      if (it.path.toLowerCase().startsWith(low)) {
+        it.path = newPath + it.path.slice(from.length);
+        it.name = path.basename(it.path);
+        it.fid = await fidOf(it.path);
+      }
+    }
+    // Entries removed while the folder was lost point at the old place; move them across so
+    // they are recognised again.
+    for (const r of this.d.removed || []) {
+      if (r.item.batchId === b.id && r.item.path.toLowerCase().startsWith(low)) r.item.path = newPath + r.item.path.slice(from.length);
+    }
+    this.pushLog({ id: newId(), time: Date.now(), kind: 'folder', name: b.name, from, to: newPath });
+    this.index = null;
+    const files = await fo.listImages(b.folder, b.recursive);
+    const added = await this.addFiles(b, files);
+    this.changed([]);
+    return added;
+  }
+
+  // "Find folder…": the user picks the new location themselves.
+  async relocateBatch(batchId, newPath) {
+    const b = this.d.batches.find((x) => x.id === batchId);
+    if (!b) throw new Error('Folder not found in the list');
+    if (!(await fo.exists(newPath))) throw new Error('That folder does not exist');
+    if (this.d.batches.some((x) => x.id !== batchId && samePath(x.folder, newPath))) throw new Error('That folder is already in the list');
+    const from = b.folder;
+    const added = await this.applyFolderMove(b, newPath);
+    return { from, to: newPath, restored: added.length, total: Object.values(this.d.items).filter((i) => i.batchId === b.id).length };
+  }
+
+  // Searches again for one folder (or all of them) on demand.
+  async findMissingFolders(batchId) {
+    for (const b of this.d.batches) {
+      if (batchId && b.id !== batchId) continue;
+      if (!b.missing) continue;
+      b.fid = b.fid || null;
+      const found = await this.findFolder(b);
+      if (found) { const added = await this.applyFolderMove(b, found); return { found, restored: added.length }; }
+    }
+    return { found: null };
+  }
+
+  // ---------- library backups ----------
+  async backup(reason) {
+    try {
+      this.store.flush();
+      const dir = path.join(this.paths.data, 'Backups');
+      await fsp.mkdir(dir, { recursive: true });
+      const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+      const file = path.join(dir, `library-${stamp}-${reason}.json`);
+      if (!(await fo.exists(file))) await fsp.copyFile(this.store.file, file);
+      const all = (await fsp.readdir(dir)).filter((n) => /^library-.*\.json$/.test(n)).sort();
+      for (const old of all.slice(0, Math.max(0, all.length - 15))) await fsp.unlink(path.join(dir, old)).catch(() => {});
+      return file;
+    } catch (_) { return null; }
+  }
+
+  async listBackups() {
+    const dir = path.join(this.paths.data, 'Backups');
+    let names;
+    try { names = await fsp.readdir(dir); } catch { return []; }
+    const out = [];
+    for (const n of names.filter((x) => /^library-.*\.json$/.test(x))) {
+      const file = path.join(dir, n);
+      try {
+        const st = await fsp.stat(file);
+        const d = JSON.parse(await fsp.readFile(file, 'utf8'));
+        out.push({ file, name: n, time: st.mtimeMs, size: st.size, items: Object.keys(d.items || {}).length, folders: (d.batches || []).length, reason: (n.match(/^library-.{19}-(.+)\.json$/) || [])[1] || '' });
+      } catch (_) { /* skip unreadable */ }
+    }
+    return out.sort((a, b) => b.time - a.time);
+  }
+
+  async restoreBackup(file) {
+    const data = JSON.parse(await fsp.readFile(file, 'utf8'));
+    if (!data || typeof data !== 'object' || !data.items) throw new Error('That file is not an Image Seek library backup');
+    await this.backup('before-restore');
+    this.store.data = Object.assign({ version: 2, batches: [], items: {}, downloads: {}, sortLog: [], removed: [] }, data);
+    this.migrate();
+    this.store.flush();
+    this.changed([]);
+    return { items: Object.keys(this.d.items).length, folders: this.d.batches.length };
+  }
+
   // ---------- files renamed, moved or deleted outside the app ----------
   // Every tracked file is checked. One that's gone from its path is looked for by its file ID
   // (recent folder-watch events, its old folder, then the watched folders). If found, the app
@@ -485,6 +761,17 @@ class Library {
     this.checking = true;
     let changes = 0;
     try {
+      // Folders first: a file is only really gone if the folder holding it is still there.
+      const folderEvents = await this.checkFolders();
+      if (folderEvents.length) { changes += folderEvents.length; this.events.push(...folderEvents); }
+      const skipBatch = new Set(this.d.batches.filter((b) => b.missing).map((b) => b.id));
+      const s = this.settings.get();
+      const sortRootOk = !s.sortRoot || await fo.exists(s.sortRoot);
+      const downloadsOk = !s.downloadsDir || await fo.exists(s.downloadsDir);
+      // Only worth mentioning when there's something in there to lose — these folders are made
+      // when they're first needed, so a folder that was never used isn't missing, just not there.
+      if (!sortRootOk && this.d.sortLog.some((l) => l.to && !l.undone && !l.kind)) this.events.push({ type: 'root-missing', what: 'sort folder', from: s.sortRoot });
+      if (!downloadsOk && Object.keys(this.d.downloads).length) this.events.push({ type: 'root-missing', what: 'downloads folder', from: s.downloadsDir });
       const missing = [];
       const jobs = [];
       const watch = (kind, ref, p) => jobs.push(async () => {
@@ -496,20 +783,31 @@ class Library {
       for (const it of Object.values(this.d.items)) {
         if (this.originalGone(it)) continue;
         if (it.originalSorted) continue; // followed through its log entry
+        if (skipBatch.has(it.batchId)) continue; // its folder is missing: wait for the folder
         watch('item', it, it.path);
       }
-      for (const dl of Object.values(this.d.downloads)) {
-        if (dl.state !== 'completed' || dl.sortedTo) continue;
-        watch('download', dl, dl.path);
+      if (downloadsOk) {
+        for (const dl of Object.values(this.d.downloads)) {
+          if (dl.state !== 'completed' || dl.sortedTo) continue;
+          watch('download', dl, dl.path);
+        }
       }
-      for (const l of this.d.sortLog) {
-        if (l.kind === 'gone' || l.kind === 'moved' || l.undone || l.missingAt) continue;
-        watch('log', l, l.to);
+      if (sortRootOk) {
+        for (const l of this.d.sortLog) {
+          if (l.kind === 'gone' || l.kind === 'moved' || l.kind === 'folder' || l.undone || l.missingAt) continue;
+          watch('log', l, l.to);
+        }
       }
       await runLimited(jobs, 24);
 
       if (missing.length) {
         const found = await this.locate(missing.filter((m) => m.fid));
+        // A backup first whenever a lot would drop out at once, so it can always be undone.
+        const losing = missing.filter((m) => !(m.fid && found.get(m.fid)));
+        if (losing.length >= 5) {
+          const file = await this.backup('files-missing');
+          if (file) this.events.push({ type: 'backup', count: losing.length, file });
+        }
         for (const m of missing) {
           const np = m.fid && found.get(m.fid);
           // still really gone? (it may have come back while we looked)
@@ -523,10 +821,14 @@ class Library {
       const now = Date.now();
       const before = this.d.sortLog.length;
       this.d.sortLog = this.d.sortLog.filter((l) => {
-        const t = l.kind === 'gone' || l.kind === 'moved' ? l.time : l.missingAt;
+        const t = l.kind === 'gone' || l.kind === 'moved' || l.kind === 'folder' ? l.time : l.missingAt;
         return !t || now - t < LOG_KEEP_MISSING;
       });
       if (this.d.sortLog.length !== before) changes++;
+      if (this.d.removed && this.d.removed.length) {
+        const keep = this.d.removed.filter((r) => now - r.removedAt < LOG_KEEP_MISSING);
+        if (keep.length !== this.d.removed.length) { this.d.removed = keep; changes++; }
+      }
     } finally {
       this.checking = false;
     }
@@ -577,10 +879,15 @@ class Library {
 
   watchedRoots() {
     const s = this.settings.get();
-    const roots = this.d.batches.map((b) => ({ path: b.folder, recursive: !!b.recursive }));
+    const roots = this.d.batches.filter((b) => !b.missing).map((b) => ({ path: b.folder, recursive: !!b.recursive }));
     if (s.downloadsDir) roots.push({ path: s.downloadsDir, recursive: true });
     if (s.sortRoot) roots.push({ path: s.sortRoot, recursive: true });
     return roots;
+  }
+
+  // Parent folders of missing ones, watched so a rename back is noticed at once.
+  probeRoots() {
+    return this.d.batches.filter((b) => b.missing).map((b) => ({ path: path.dirname(b.folder), recursive: false }));
   }
 
   async folderIndex(force) {
@@ -682,7 +989,7 @@ class Library {
   }
 
   async lose(m) {
-    const gone = (what, name, p) => this.pushLog({ id: newId(), time: Date.now(), kind: 'gone', what, name, from: p, to: null });
+    const gone = (what, name, p) => this.pushLog({ id: newId(), time: Date.now(), kind: 'gone', what, name, from: p, to: null, fid: m.fid || null });
     if (m.kind === 'item') {
       const it = m.ref;
       if (!this.d.items[it.id]) return;
@@ -767,7 +1074,7 @@ class Library {
   async reconcile(paths) {
     if (this.reconciling) {
       this.again = this.again === undefined ? (paths ? [...paths] : null) : (this.again === null || !paths ? null : this.again.concat(paths));
-      return { changes: 0, added: [] };
+      return { changes: 0, added: [], events: [] };
     }
     this.reconciling = true;
     try {
@@ -775,7 +1082,9 @@ class Library {
       let todo = paths;
       if (this.later && this.later.size) { todo = todo ? todo.concat([...this.later]) : todo; this.later.clear(); }
       const added = await this.pickUpNew(todo);
-      return { changes, added };
+      const events = this.events;
+      this.events = [];
+      return { changes, added, events };
     } finally {
       this.reconciling = false;
       if (this.again !== undefined) {
@@ -786,7 +1095,8 @@ class Library {
     }
   }
 
-  forgetItemQuiet(it) {
+  forgetItemQuiet(it, reason) {
+    this.remember(it, reason || 'missing');
     for (const dlId of it.downloads || []) {
       const dl = this.d.downloads[dlId];
       if (dl) { if (dl.sortedTo) delete this.d.downloads[dlId]; else dl.itemId = null; }

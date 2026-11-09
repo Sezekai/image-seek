@@ -464,6 +464,115 @@ test('new images in an added folder are picked up', async () => {
   assert.strictEqual(r.added.length, 0);
 });
 
+// ---------------- library: the input folder is renamed or moved ----------------
+// Each file keeps its lookup results: the folder is found again by its folder ID, or failing that
+// by the names of the files inside it, and otherwise the person points the app at it by hand.
+const tagResults = (lib) => {
+  for (const it of Object.values(lib.d.items)) {
+    it.results = [{ engine: 'iqdb', url: 'https://danbooru.donmai.us/posts/1', similarity: 93 }];
+    it.guess = { series: 'Hololive', character: 'Pekora' };
+    it.engines = { iqdb: 'done' };
+    it.status = 'done';
+  }
+};
+
+test('renamed input folder is found again by its folder ID, with results kept', async () => {
+  const { lib, root, src } = makeLib();
+  await lib.addBatch(src, false);
+  tagResults(lib);
+  const b = lib.d.batches[0];
+  assert.ok(b.fid, 'the folder ID is recorded when the folder is added');
+  const moved = path.join(root, 'renamed pics');
+  fs.renameSync(src, moved);
+  const r = await lib.checkMissing();
+  void r;
+  assert.strictEqual(lib.d.batches[0].folder, moved, 'the batch points at the new path');
+  assert.strictEqual(lib.d.batches[0].name, 'renamed pics');
+  assert.ok(!lib.d.batches[0].missing);
+  const items = Object.values(lib.d.items);
+  assert.strictEqual(items.length, 3, 'all three files are still there');
+  for (const it of items) {
+    assert.strictEqual(path.dirname(it.path), moved, it.name + ' has the new path');
+    assert.ok(fs.existsSync(it.path));
+    assert.strictEqual(it.status, 'done');
+    assert.strictEqual(it.guess.character, 'Pekora', 'the lookup result is kept');
+  }
+  assert.ok(lib.d.sortLog.some((l) => l.kind === 'folder'), 'the move is noted in the log');
+});
+
+test('moved folder with no recorded ID is found by the names of its files', async () => {
+  const { lib, root, src } = makeLib();
+  await lib.addBatch(src, false);
+  tagResults(lib);
+  delete lib.d.batches[0].fid; // a folder added by an older version
+  const deep = path.join(root, 'Pictures', 'art', 'to sort');
+  fs.mkdirSync(path.dirname(deep), { recursive: true });
+  fs.renameSync(src, deep);
+  await lib.checkMissing();
+  assert.strictEqual(lib.d.batches[0].folder, deep);
+  assert.strictEqual(Object.keys(lib.d.items).length, 3);
+  assert.strictEqual(Object.values(lib.d.items)[0].guess.character, 'Pekora');
+});
+
+test('a folder that can\'t be found is flagged, not emptied, and relinks by hand', async () => {
+  const { lib, root, src } = makeLib();
+  await lib.addBatch(src, false);
+  tagResults(lib);
+  const away = fs.mkdtempSync(path.join(os.tmpdir(), 'away-'));
+  const moved = path.join(away, 'elsewhere');
+  fs.renameSync(src, moved);
+  lib.d.batches[0].fid = '0:0'; // pretend the ID no longer matches, so only a manual fix is left
+  const before = JSON.stringify(lib.d.batches[0].folder);
+  await lib.checkMissing();
+  const b = lib.d.batches[0];
+  assert.ok(b.missing, 'the folder is flagged as missing');
+  assert.strictEqual(JSON.stringify(b.folder), before, 'the old path is kept so it can be shown');
+  assert.strictEqual(Object.keys(lib.d.items).length, 3, 'no files are dropped while the folder is missing');
+  assert.strictEqual((await lib.findMissingFolders()).found, null, 'and it genuinely cannot be found');
+
+  const r = await lib.relocateBatch(b.id, moved);
+  assert.ok(r.ok !== false);
+  const nb = lib.d.batches[0];
+  assert.strictEqual(nb.folder, moved);
+  assert.ok(!nb.missing, 'the flag is cleared');
+  const items = Object.values(lib.d.items);
+  assert.strictEqual(items.length, 3);
+  for (const it of items) {
+    assert.strictEqual(path.dirname(it.path), moved);
+    assert.strictEqual(it.guess.character, 'Pekora', 'results survive a manual relink');
+    assert.ok(!it.originalMissing);
+  }
+  void root;
+});
+
+test('a file deleted and put back keeps its results, and backups can be restored', async () => {
+  const { lib, src } = makeLib();
+  await lib.addBatch(src, false);
+  tagResults(lib);
+  const p = path.join(src, 'one.jpg');
+  const keep = fs.readFileSync(p);
+  fs.unlinkSync(p);
+  await lib.checkMissing();
+  assert.strictEqual(Object.keys(lib.d.items).length, 2, 'the missing file is removed');
+  assert.ok((lib.d.removed || []).some((x) => x.item.name === 'one.jpg'), 'it is remembered in case it comes back');
+  fs.writeFileSync(p, keep);
+  const r = await lib.addFiles(lib.d.batches[0], [p]);
+  assert.strictEqual(r.length, 1);
+  const back = Object.values(lib.d.items).find((i) => i.name === 'one.jpg');
+  assert.ok(back, 'the file is back');
+  assert.strictEqual(back.guess.character, 'Pekora', 'its earlier lookup is reused instead of looking it up again');
+  assert.strictEqual(back.status, 'looked', 'and it goes back to waiting to be sorted, not to be looked up');
+
+  const file = await lib.backup('manual');
+  assert.ok(file, 'a backup is written');
+  const list = await lib.listBackups();
+  assert.ok(list.length >= 1 && list[0].items === 3, 'the backup lists its contents');
+  for (const it of Object.values(lib.d.items)) lib.forgetItem(it.id);
+  assert.strictEqual(Object.keys(lib.d.items).length, 0);
+  const res = await lib.restoreBackup(list[0].file);
+  assert.strictEqual(res.items, 3, 'restoring brings the file list back');
+});
+
 const iqdbMod = require('../src/main/lookup/iqdb');
 test('IQDB busy page is retried later, not failed', async () => {
   const fake = (html, status = 200) => async () => ({ status, ok: status < 400, text: async () => html });

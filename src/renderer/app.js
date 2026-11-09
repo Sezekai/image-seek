@@ -1,4 +1,4 @@
-import { api, state, h, icon, clear, on, emit, toast, viewImage, fileUrl, fmtTime, prepForUpload, dHash, modal } from './core.js';
+import { api, state, h, icon, clear, on, emit, toast, viewImage, fileUrl, fmtTime, prepForUpload, dHash, modal, progressBar } from './core.js';
 import { activeSortPanel, toggleNsfw, toggleVery } from './sortpanel.js';
 import { LookupsView } from './views/lookups.js';
 import { Browser, BrowserView } from './views/browser.js';
@@ -142,6 +142,13 @@ function renderStatus() {
   if (q.paused) parts.push(h('span', { class: 'chip warn' }, 'Lookups paused'));
   else if (q.current) parts.push(h('span', { class: 'pill' }, h('span', { class: 'dot looking' }), ` ${q.current.engine ? q.current.engine + ': ' : ''}${q.current.name}`));
   if (q.queued) parts.push(h('span', { class: 'chip' }, `${q.queued} queued`));
+  // Progress with a percentage, time spent and time left for the current run of lookups.
+  if (q.progress && q.progress.total > 1 && !q.paused) {
+    const pb = progressBar();
+    pb.style.width = '260px';
+    pb.set({ ...q.progress, unit: 'items', label: 'looked up' });
+    parts.push(pb);
+  }
   if (q.waitingSauce) parts.push(h('span', { class: 'chip warn', title: 'Waiting for SauceNAO quota — they\'ll continue automatically' }, `${q.waitingSauce} waiting for SauceNAO`));
   if (q.waitingIqdb) parts.push(h('span', { class: 'chip warn', title: 'IQDB was busy — these are retried automatically' }, `${q.waitingIqdb} waiting for IQDB`));
   if (q.failed && q.failed.all) parts.push(h('span', { class: 'chip red', title: 'Failed or blocked lookups — use Retry in Lookups' }, `${q.failed.all} failed`));

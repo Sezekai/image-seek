@@ -1,7 +1,7 @@
 // Every downloaded file and the file it's linked to. Unlink, relink, recycle or sort them.
 import {
   api, state, h, icon, btn, seg, clear, thumbUrl, fileUrl, fmtBytes, fmtDims, fmtTime, toast, on, emit,
-  popupMenu, viewImage, hostOf, basename, makeResizable, confirmBox, dHash, hamming, lsGet, lsSet,
+  popupMenu, viewImage, hostOf, basename, makeResizable, confirmBox, dHash, hamming, lsGet, lsSet, progressBar,
 } from '../core.js';
 import { createSortPanel } from '../sortpanel.js';
 
@@ -78,7 +78,7 @@ export class DownloadsView {
           h('div', { class: 'ell' }, d.name || basename(d.path)),
           h('div', { class: 'xs dim ell' }, `${fmtDims(d.width, d.height)} · ${fmtBytes(d.size || d.total)} · ${hostOf(d.pageUrl || d.url)} · ${fmtTime(d.time)}`)),
         this.isFlagged(d) ? h('span', { class: 'chip warn' }, 'unrelated?') : null,
-        d.state === 'progress' ? h('div', { class: 'progress', dataset: { dl: d.id } }, h('div')) : null,
+        d.state === 'progress' ? this.bar(d, '320px') : null,
         it ? h('div', { class: 'row', style: { width: '230px', flex: 'none' } }, icon('link'), h('img', { class: 'th', src: thumbUrl(it.path, 80), style: { width: '28px', height: '28px' } }), h('span', { class: 'ell xs' }, it.name))
           : h('div', { class: 'row xs dim', style: { width: '230px', flex: 'none' } }, icon('unlink'), 'Unlinked'));
       this.listEl.appendChild(row);
@@ -97,15 +97,27 @@ export class DownloadsView {
         h('div', { class: 'lchips' },
           bigger ? h('span', { class: 'chip green' }, 'larger') : null,
           this.isFlagged(d) ? h('span', { class: 'chip warn' }, 'unrelated?') : null,
-          d.state === 'progress' ? h('div', { class: 'progress', dataset: { dl: d.id } }, h('div')) : null),
+          d.state === 'progress' ? this.bar(d) : null),
         it ? h('div', { class: 'llink', title: 'Linked to ' + it.name }, icon('link'), h('img', { src: thumbUrl(it.path, 80) }), h('span', { class: 'ell' }, it.name))
           : h('div', { class: 'llink dim' }, icon('unlink'), 'Unlinked'),
         h('div', { class: 'lfoot' }, h('span', null, fmtTime(d.time)))));
   }
 
+  // A progress bar for a download in flight: percentage, size, time spent and time left.
+  bar(d, width) {
+    const pb = progressBar();
+    pb.dataset.dl = d.id;
+    if (width) pb.style.width = width;
+    pb.set({ done: d.received || 0, total: d.total || 0, started: d.started || d.time });
+    return pb;
+  }
+
   progress({ id, received, total }) {
-    const el = this.listEl.querySelector(`[data-dl="${id}"] > div`);
-    if (el && total) el.style.width = Math.round((received / total) * 100) + '%';
+    const d = state.downloads.get(id);
+    if (d) { d.received = received; if (total) d.total = total; if (!d.started) d.started = d.time || Date.now(); }
+    for (const pb of this.root.querySelectorAll(`[data-dl="${id}"]`)) {
+      if (pb.set) pb.set({ done: received, total: total || (d && d.total) || 0, started: (d && (d.started || d.time)) || null });
+    }
   }
 
   renderSide() {
