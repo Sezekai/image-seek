@@ -685,6 +685,18 @@ class Library {
   }
 
   // "Find folder…": the user picks the new location themselves.
+  // How many of the files this folder is known to have held are in the chosen folder — used to
+  // warn before pointing a folder at somewhere that clearly isn't it.
+  async folderLooksRight(batchId, dir) {
+    const b = this.d.batches.find((x) => x.id === batchId);
+    if (!b) return { known: 0, matched: 0 };
+    const names = this.folderNames(b);
+    let entries;
+    try { entries = await fsp.readdir(dir); } catch { return { known: names.length, matched: 0 }; }
+    const have = new Set(entries.map((n) => n.toLowerCase()));
+    return { known: names.length, matched: names.filter((n) => have.has(n)).length };
+  }
+
   async relocateBatch(batchId, newPath) {
     const b = this.d.batches.find((x) => x.id === batchId);
     if (!b) throw new Error('Folder not found in the list');

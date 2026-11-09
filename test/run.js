@@ -530,6 +530,9 @@ test('a folder that can\'t be found is flagged, not emptied, and relinks by hand
   assert.strictEqual(Object.keys(lib.d.items).length, 3, 'no files are dropped while the folder is missing');
   assert.strictEqual((await lib.findMissingFolders()).found, null, 'and it genuinely cannot be found');
 
+  assert.deepStrictEqual(await lib.folderLooksRight(b.id, moved), { known: 3, matched: 3 }, 'the right folder is recognised');
+  assert.strictEqual((await lib.folderLooksRight(b.id, away)).matched, 0, 'a folder with none of the files is not');
+
   const r = await lib.relocateBatch(b.id, moved);
   assert.ok(r.ok !== false);
   const nb = lib.d.batches[0];

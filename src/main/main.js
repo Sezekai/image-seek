@@ -288,6 +288,7 @@ function setupIpc() {
     return { added: r.added, skipped: r.skipped, batchId: r.batch.id };
   });
   handle('batch:remove', async (id) => { lib.removeBatch(id); watcher.refresh(); });
+  handle('batch:check', async (id, folder) => lib.folderLooksRight(id, folder));
   handle('batch:relocate', async (id, folder) => {
     const r = await lib.relocateBatch(id, folder);
     log(`Folder moved: ${r.from} → ${r.to}${r.restored ? `, ${r.restored} file(s) back in the list` : ''}`);

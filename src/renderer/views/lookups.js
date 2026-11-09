@@ -117,6 +117,9 @@ export class LookupsView {
   async relocate(b) {
     const folder = await api.call('dialog:folder', `Where is "${b.name}" now?`, b.folder);
     if (!folder) return;
+    const chk = await api.call('batch:check', b.id, folder).catch(() => null);
+    if (chk && chk.known && !chk.matched && !(await confirmBox('That folder doesn\'t look like the right one',
+      `None of the ${chk.known} file${chk.known === 1 ? '' : 's'} this folder used to hold are in there. Point "${b.name}" at it anyway?`, 'Use it'))) return;
     const r = await safe(() => api.call('batch:relocate', b.id, folder));
     if (r) toast(`Folder updated — ${r.total} file${r.total === 1 ? '' : 's'} back in the list${r.restored ? ` (${r.restored} recovered)` : ''}`, 'info', 6000);
   }
