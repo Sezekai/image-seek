@@ -142,6 +142,15 @@ class Library {
         revived.push(back);
         continue;
       }
+      // An entry kept only for its downloads (its original went missing) is the same image as
+      // a file of the same name turning up in its folder — combine them instead of doubling up.
+      const stale = this.findStale(batch.id, f, fid);
+      if (stale) {
+        await this.adoptFile(stale, f, fid);
+        known.add(f.toLowerCase());
+        revived.push(stale);
+        continue;
+      }
       const it = {
         id: newId(), batchId: batch.id, path: f, name: path.basename(f),
         status: 'queued', phase: 'lookup', engines: {}, results: [], downloads: [], addedAt: Date.now(),
@@ -153,6 +162,50 @@ class Library {
       added.push(it);
     }
     return added.concat(revived);
+  }
+
+  // ---------- entries kept only for their downloads, whose original file has since reappeared ----------
+  staleCandidates(batchId) {
+    return Object.values(this.d.items).filter((it) => it.batchId === batchId && it.originalMissing && !it.originalRecycled && !it.originalSorted);
+  }
+
+  findStale(batchId, filePath, fid) {
+    const cands = this.staleCandidates(batchId);
+    if (!cands.length) return null;
+    if (fid) { const byId = cands.find((it) => it.fid && it.fid === fid); if (byId) return byId; }
+    const base = path.basename(filePath).toLowerCase();
+    return cands.find((it) => path.basename(it.path).toLowerCase() === base) || null;
+  }
+
+  // Points an existing entry (with its results and downloads) at the file's current place.
+  async adoptFile(it, filePath, fid) {
+    it.path = filePath;
+    it.name = path.basename(filePath);
+    it.fid = fid || null;
+    delete it.originalMissing;
+    try { Object.assign(it, pickInfo(await getImageInfo(filePath))); } catch (_) { /* unreadable header */ }
+    if (it.status === 'done' && this.pending(it).length) it.status = 'looked';
+    if (it.status === 'queued' && ((it.results || []).length || Object.keys(it.engines || {}).length)) it.status = 'looked';
+  }
+
+  // Cleans up entries that were already doubled: an old entry with downloads whose original is
+  // missing, next to a fresh entry for the same file. The fresh one is folded into the old one.
+  async healStale() {
+    let merged = 0;
+    for (const old of Object.values(this.d.items)) {
+      if (!this.d.items[old.id] || !old.originalMissing || old.originalRecycled || old.originalSorted) continue;
+      const base = path.basename(old.path).toLowerCase();
+      const twin = Object.values(this.d.items).find((x) => x !== old && x.batchId === old.batchId
+        && !this.originalGone(x) && !(x.downloads || []).length && path.basename(x.path).toLowerCase() === base
+        && (!old.width || !x.width || (old.width === x.width && old.height === x.height))
+        && (!old.size || !x.size || old.size === x.size));
+      if (!twin || !(await fo.exists(twin.path))) continue;
+      const p = twin.path, fid = twin.fid;
+      delete this.d.items[twin.id];
+      await this.adoptFile(old, p, fid);
+      merged++;
+    }
+    return merged;
   }
 
   // ---------- entries removed earlier, kept for 30 days so they can come back ----------
@@ -680,6 +733,8 @@ class Library {
     this.index = null;
     const files = await fo.listImages(b.folder, b.recursive);
     const added = await this.addFiles(b, files);
+    const merged = await this.healStale();
+    if (merged) this.events.push({ type: 'merged', count: merged });
     this.changed([]);
     return added;
   }
@@ -776,6 +831,8 @@ class Library {
       // Folders first: a file is only really gone if the folder holding it is still there.
       const folderEvents = await this.checkFolders();
       if (folderEvents.length) { changes += folderEvents.length; this.events.push(...folderEvents); }
+      const merged = await this.healStale();
+      if (merged) { changes += merged; this.events.push({ type: 'merged', count: merged }); }
       const skipBatch = new Set(this.d.batches.filter((b) => b.missing).map((b) => b.id));
       const s = this.settings.get();
       const sortRootOk = !s.sortRoot || await fo.exists(s.sortRoot);

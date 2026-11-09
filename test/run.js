@@ -576,6 +576,44 @@ test('a file deleted and put back keeps its results, and backups can be restored
   assert.strictEqual(res.items, 3, 'restoring brings the file list back');
 });
 
+test('an entry kept for its downloads is combined with the same file after a folder rename', async () => {
+  const { lib, root, src } = makeLib();
+  await lib.addBatch(src, false);
+  tagResults(lib);
+  const one = Object.values(lib.d.items).find((i) => i.name === 'one.jpg');
+  // v1.3.0 state: the original is "missing" but kept because it has a download, at a stale path.
+  const dl = lib.addDownload({ itemId: one.id, path: path.join(root, 'dl.jpg'), name: 'dl.jpg', url: 'https://x/y.jpg', total: 1 });
+  fs.writeFileSync(dl.path, 'x');
+  one.downloads = [dl.id];
+  one.originalMissing = true;
+  one.path = path.join(root, 'old name that is gone', 'one.jpg');
+  const moved = path.join(root, 'renamed');
+  fs.renameSync(src, moved);
+  lib.d.batches[0].folder = moved; // as if the folder was already found
+  // a fresh entry for the same file appears (what the re-scan used to do)
+  const added = await lib.addFiles(lib.d.batches[0], fs.readdirSync(moved).map((n) => path.join(moved, n)));
+  assert.ok(added.includes(one), 'the old entry is reused');
+  const ones = Object.values(lib.d.items).filter((i) => i.name === 'one.jpg');
+  assert.strictEqual(ones.length, 1, 'no duplicate');
+  assert.strictEqual(ones[0].id, one.id);
+  assert.strictEqual(ones[0].path, path.join(moved, 'one.jpg'));
+  assert.ok(!ones[0].originalMissing);
+  assert.deepStrictEqual(ones[0].downloads, [dl.id], 'its download is still linked');
+  assert.strictEqual(ones[0].guess.character, 'Pekora', 'and its results');
+
+  // already doubled: an old entry and a fresh one side by side get folded together
+  const fresh = { ...JSON.parse(JSON.stringify(ones[0])), id: 'dup1', downloads: [], results: [], guess: undefined, status: 'queued', engines: {} };
+  ones[0].originalMissing = true;
+  ones[0].path = path.join(root, 'gone', 'one.jpg');
+  lib.d.items.dup1 = fresh;
+  const n = await lib.healStale();
+  assert.strictEqual(n, 1);
+  assert.strictEqual(Object.values(lib.d.items).filter((i) => i.name === 'one.jpg').length, 1);
+  assert.ok(!lib.d.items.dup1, 'the fresh copy is gone');
+  assert.strictEqual(lib.d.items[one.id].path, path.join(moved, 'one.jpg'));
+  assert.deepStrictEqual(lib.d.items[one.id].downloads, [dl.id]);
+});
+
 const iqdbMod = require('../src/main/lookup/iqdb');
 test('IQDB busy page is retried later, not failed', async () => {
   const fake = (html, status = 200) => async () => ({ status, ok: status < 400, text: async () => html });

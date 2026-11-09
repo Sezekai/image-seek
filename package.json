@@ -1,7 +1,7 @@
 {
   "name": "image-seek",
   "productName": "Image Seek",
-  "version": "1.4.0",
+  "version": "1.4.1",
   "description": "Identify images and find higher-resolution versions",
   "main": "src/main/main.js",
   "author": "Sezekai",

@@ -491,6 +491,7 @@ app.whenReady().then(async () => {
     for (const ev of r.events || []) {
       if (ev.type === 'folder-moved') log(`Folder "${ev.name}" was renamed or moved — found it at ${ev.to}${ev.restored ? `, ${ev.restored} file(s) back in the list` : ''}`);
       else if (ev.type === 'folder-missing') log(`Folder not found: ${ev.from} — nothing from it has been removed. Use "Find folder…" in Lookups to point at its new place.`, 'warn');
+      else if (ev.type === 'merged') log(`Combined ${ev.count} file${ev.count === 1 ? '' : 's'} with ${ev.count === 1 ? 'its' : 'their'} earlier ${ev.count === 1 ? 'entry' : 'entries'} — downloads and results kept`);
       else if (ev.type === 'folder-back') log(`Folder "${ev.name}" is back`);
       else if (ev.type === 'root-missing') log(`Your ${ev.what} is missing (${ev.from}) — those files are left alone until it is back. Check it in Settings.`, 'warn');
       else if (ev.type === 'backup') log(`${ev.count} file(s) went missing — saved a library backup first (Settings → Backups)`, 'warn');
